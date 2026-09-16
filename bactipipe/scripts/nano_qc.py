@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 from bactipipe.scripts.utils import fastq_metrics, filtlong_with_metrics, merge_gz_fastqs, merge_gz_fastqs_s3, logger as file_logger
+from bactipipe.nanopore_quality import filtlong_min_mean_identity
 
 def filtlong_version():
     vercmd = ["filtlong", "--version"]
@@ -16,7 +17,7 @@ def filtlong_version():
 def qc_nano(
     fastq_file=None,
     raw_folder=None,
-    genome_size=5e6,
+    genome_size=None,
     min_avg_quality=15,
     min_read_length=1000,
     min_coverage=100,
@@ -29,6 +30,8 @@ def qc_nano(
     logfile=None
 ):
     s_name = os.path.basename(output_fastq).replace(".gz", "").replace(".fastq", "")
+    # Filtlong expects mean percent correctness, not a Phred-scale number.
+    filtlong_quality = str(filtlong_min_mean_identity(min_avg_quality))
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -36,7 +39,13 @@ def qc_nano(
     def log(msg, level="Norm", mode="timestamp"):
         file_logger(worker_log, msg, message_type=level, mode=mode)
 
-    log(f"[{s_name}] Starting QC for {s_name} with genome size {genome_size} and min coverage {min_coverage}X.")
+    if genome_size is None:
+        log(
+            f"[{s_name}] Starting size-independent QC; the organism genome size "
+            "is not known before assembly."
+        )
+    else:
+        log(f"[{s_name}] Starting QC for {s_name} with genome size {genome_size} and min coverage {min_coverage}X.")
 
     if s3 and not bucket:
         log("S3 mode requires bucket to be set.")
@@ -90,23 +99,34 @@ def qc_nano(
             mean_quality = m1['mean_q_read_np']
             log(f"\t[{s_name}] ---> Raw Mean Quality: {mean_quality:.2f}", mode='simple')
 
-            # Trim reads using filtlong
-            # Check if there is enough data for min coverage
-            min_required_bases = min_coverage * genome_size
+            # Trim reads using Filtlong. Unknown organisms intentionally omit
+            # size-dependent target-bases/downsampling arguments.
             trimmed_output = output_fastq 
 
             log(f"[{s_name}] Trimming reads using filtlong (version: {filtlong_version()})...")
-            if total_bases < min_required_bases:
+            log(f"[{s_name}] Nanopore mean-read Q >= {min_avg_quality}; Filtlong mean identity >= {filtlong_quality}%.")
+            if genome_size is None:
+                coverage_target = None
+                filtlong_command = [
+                    "filtlong",
+                    "--min_mean_q",
+                    filtlong_quality,
+                    "--min_length",
+                    str(min_read_length),
+                    fastq_file,
+                ]
+            elif total_bases < min_coverage * genome_size:
+                min_required_bases = min_coverage * genome_size
                 log(f"[{s_name}] Insufficient data for {min_coverage}X coverage. Total bases available: {total_bases:,}. Required: {min_required_bases:,}.")
                 log(f"[{s_name}] Keeping the best 90% of reads...")
-                filtlong_command = ["filtlong", "--min_mean_q", str(min_avg_quality), "--keep_percent", "90", "--min_length", str(min_read_length), fastq_file]
+                filtlong_command = ["filtlong", "--min_mean_q", filtlong_quality, "--keep_percent", "90", "--min_length", str(min_read_length), fastq_file]
                 coverage_target = 1
             
             else:
                 log(f"[{s_name}] QC: Min quality = {min_avg_quality}, target coverage: {desired_coverage}X coverage")
                 coverage_target = desired_coverage
                 required_bases = int(coverage_target * genome_size)
-                filtlong_command = ["filtlong", "--min_mean_q", str(min_avg_quality), "--target_bases", str(required_bases), "--min_length", str(min_read_length), fastq_file]
+                filtlong_command = ["filtlong", "--min_mean_q", filtlong_quality, "--target_bases", str(required_bases), "--min_length", str(min_read_length), fastq_file]
 
             try:
                 os.makedirs(os.path.dirname(trimmed_output), exist_ok=True)
@@ -133,7 +153,7 @@ def qc_nano(
                 f.write(f"Trimmed Mean Quality per Read (Arithmetic): {m2['mean_q_per_read_arith']:.2f}\n")
                 f.write(f"Trimmed Mean Quality per Base (Arithmetic): {m2['mean_q_per_base_arith']:.2f}\n")
 
-            trim_coverage = int(trim_bases / genome_size)
+            trim_coverage = int(trim_bases / genome_size) if genome_size else None
 
             # Check if the new quality meets the threshold
             if new_mean_quality >= min_avg_quality:
@@ -142,7 +162,13 @@ def qc_nano(
             else:
                 log(f"[{s_name}] Quality threshold not met. Average quality: {new_mean_quality:.2f}.", "Warn")
 
-            log(f"[{s_name}] Trimmed reads saved to {output_fastq} with {trim_coverage}X coverage and average quality {new_mean_quality:.2f}.")
+            if trim_coverage is None:
+                log(
+                    f"[{s_name}] Trimmed reads saved to {output_fastq}; final depth will use "
+                    f"the assembled genome length. Average quality: {new_mean_quality:.2f}."
+                )
+            else:
+                log(f"[{s_name}] Trimmed reads saved to {output_fastq} with {trim_coverage}X coverage and average quality {new_mean_quality:.2f}.")
             # Cleanup
             log(f"[{s_name}] Cleaning up intermediate files...")
             for item in clutter:
@@ -151,7 +177,7 @@ def qc_nano(
                         shutil.rmtree(item)
                     else:
                         os.remove(item)
-            if coverage_target < min_coverage:
+            if coverage_target is not None and coverage_target < min_coverage:
                 log(f"[{s_name}] Unable to achieve {min_avg_quality} average quality with minimum coverage of {min_coverage}X.")
         else:
             log(f"[{s_name}] Quality metrics file already exists. Skipping quality assessment.")

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import StringIO
+import re
+import json
+import math
+from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from xml.sax.saxutils import escape
 
 import pandas as pd
 
@@ -28,8 +33,8 @@ class LayoutConfig:
     bottom_margin: float = 36
 
     # Dual header band split (portion of usable width for left vs right panels)
-    left_panel_ratio: float = 0.65
-    right_panel_ratio: float = 0.35
+    left_panel_ratio: float = 0.36
+    right_panel_ratio: float = 0.64
 
     # Column width strategy for main QC table
     reserved_cols: Tuple[int, int] = (2, 3)     # Expected & Identified organism (0-based)
@@ -67,6 +72,7 @@ def render_pdf_from_rows(
     tools_header: Optional[Sequence[Tuple[str, str]]] = None,  # list of (tool, version/cutoff)
     layout: LayoutConfig = LayoutConfig(),
     run_name: Optional[str] = None,  # NEW: explicit run name override
+    lambda_evidence: Optional[dict] = None,
 ) -> str:
     """Render a QC report PDF from in-memory rows."""
     df = pd.DataFrame(rows, columns=list(header_labels))
@@ -83,6 +89,7 @@ def render_pdf_from_rows(
         tools_header=list(tools_header) if tools_header else None,
         layout=layout,
         run_name=run_name,
+        lambda_evidence=lambda_evidence,
     )
 
 
@@ -95,6 +102,7 @@ def render_pdf_from_tsv(
     subtitle: Optional[str] = None,
     layout: LayoutConfig = LayoutConfig(),
     run_name: Optional[str] = None,  # NEW: explicit run name override
+    lambda_evidence: Optional[dict] = None,
 ) -> str:
     """Render a QC report PDF directly from an already written TSV file."""
     lines = _read_lines(tsv_path)
@@ -107,7 +115,9 @@ def render_pdf_from_tsv(
     top_block, tools_pairs = _parse_header_blocks(lines, header_idx)
 
     table_text = "\n".join(lines[header_idx:])
-    df = pd.read_csv(StringIO(table_text), sep="\t")
+    df = pd.read_csv(StringIO(table_text), sep="\t", keep_default_na=False)
+    if lambda_evidence is None:
+        lambda_evidence = _load_lambda_evidence(df, Path(tsv_path).parent)
 
     run_meta = list(run_metadata) if run_metadata else (top_block or None)
 
@@ -125,6 +135,7 @@ def render_pdf_from_tsv(
         tools_header=tools_pairs or None,
         layout=layout,
         run_name=run_name,
+        lambda_evidence=lambda_evidence,
     )
 
 
@@ -211,6 +222,15 @@ def _infer_run_name_from_metadata(run_meta: Optional[List[str]]) -> Optional[str
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _styles(layout: LayoutConfig):
+    from pathlib import Path
+    import reportlab
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    heading_font = "BactiPipeVeraBold"
+    if heading_font not in pdfmetrics.getRegisteredFontNames():
+        font_path = Path(reportlab.__file__).resolve().parent / "fonts" / "VeraBd.ttf"
+        pdfmetrics.registerFont(TTFont(heading_font, str(font_path)))
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="TitleCenter", parent=styles["Title"], alignment=TA_CENTER))
     styles.add(ParagraphStyle(
@@ -221,7 +241,23 @@ def _styles(layout: LayoutConfig):
         leading=layout.header_block_font_size + 2,
     ))
     styles.add(ParagraphStyle(name="Header", parent=styles["Heading2"], spaceAfter=4))
-    styles.add(ParagraphStyle(name="HeaderRight", parent=styles["Heading2"], spaceAfter=4))
+    styles.add(ParagraphStyle(name="HeaderRight", parent=styles["Heading2"],
+                              fontName=heading_font, spaceAfter=4))
+    styles.add(ParagraphStyle(
+        name="ToolLabel", parent=styles["HeaderBlock"], fontSize=9, leading=11,
+        splitLongWords=False,
+    ))
+    styles.add(ParagraphStyle(
+        name="ToolValue", parent=styles["HeaderBlock"], fontSize=9, leading=11,
+    ))
+    styles.add(ParagraphStyle(
+        name="DatasetValue", parent=styles["HeaderBlock"], fontSize=8.5, leading=10.5,
+        spaceAfter=3,
+    ))
+    styles.add(ParagraphStyle(
+        name="HeaderSection", parent=styles["HeaderBlock"], fontName="Helvetica-Bold",
+        fontSize=10, leading=12, spaceBefore=5, spaceAfter=3,
+    ))
     styles.add(ParagraphStyle(
         name="Separator",
         parent=styles["Normal"],
@@ -297,6 +333,62 @@ def _compute_col_widths(df: pd.DataFrame, layout: LayoutConfig) -> List[float]:
 # Building sections
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _report_header_groups(tools_header):
+    """Presentation only: preserve original identifiers/filter settings in TSVs."""
+    software, datasets, thresholds = [], [], []
+    seen = set()
+    has_source_db = any(str(k).strip().casefold() == "speciesfinder db" for k, v in tools_header or [])
+    threshold_labels = {
+        "required mean quality": "Minimum mean quality",
+        "completeness cutoff": "Minimum completeness",
+        "contamination cutoff": "Maximum contamination",
+        "read filtering trigger": "Read filtering trigger",
+    }
+    for name, value in tools_header or []:
+        name, value = str(name).strip(), str(value).strip()
+        key = " ".join(name.casefold().split())
+        if key in {"minimum read length", "min read length", "minimum required length"}:
+            continue
+        if key == "speciesfinder db":
+            pair = ("SpeciesFinder db", value)
+            target = datasets
+        elif key in {"species identification database", "species id references", "speciesfinder database"} and (
+            value.startswith("BactiPipe-SpeciesFinder-") or key == "speciesfinder database"
+        ):
+            if has_source_db:
+                continue
+            pair = ("SpeciesFinder db", value.removeprefix("BactiPipe-SpeciesFinder-"))
+            target = datasets
+        elif "database" in key or key in {"reference bundle", "checkm references", "species id references"}:
+            continue  # Other database identities stay in logs/TSVs.
+        elif key in threshold_labels or "cutoff" in key or key.startswith(("minimum ", "maximum ", "required ")):
+            pair = (threshold_labels.get(key, name), value)
+            target = thresholds
+        else:
+            # Normalize only software versions, never database release/build identifiers.
+            value = re.sub(r"^" + re.escape(name) + r"\s+", "", value, flags=re.I)
+            value = re.sub(r"^version\s*:?\s*", "", value, flags=re.I)
+            if re.fullmatch(r"v?\d+(?:\.\d+)+(?:[+-][\w.-]+)?", value, flags=re.I):
+                value = "v" + value.lstrip("vV")
+            if value.casefold() in {"v?", "?", "unknown"}:
+                value = "Not recorded"
+            pair = (name, value)
+            target = software
+        identity = (pair[0].casefold(), pair[1])
+        if identity not in seen:
+            target.append(pair)
+            seen.add(identity)
+    # Keep the depth policy immediately before quality, regardless of where
+    # tool/control entries were recorded in the source header.
+    depth = [pair for pair in thresholds if pair[0].casefold() == "minimum depth"]
+    if depth:
+        thresholds = [pair for pair in thresholds if pair not in depth]
+        quality_index = next((i for i, pair in enumerate(thresholds)
+                              if pair[0] == "Minimum mean quality"), 0)
+        thresholds[quality_index:quality_index] = depth
+    return software, datasets, thresholds
+
+
 def _build_dual_header_band(
     run_metadata_lines: Optional[List[str]],
     tools_header: Optional[Sequence[Tuple[str, str]]],
@@ -304,37 +396,72 @@ def _build_dual_header_band(
     styles,
 ) -> Optional[Table]:
     """
-    Two-column band:
-      Left panel:  "Run Metadata" + lines (preserves any '====' lines from TSV)
-      Right panel: "Tools & Cutoffs" + '====' under title + (tool,value) rows + '====' after list
-    Right panel sits near the right edge via layout ratios.
+    Run metadata on the left; separate tools and threshold columns on the right.
+    Restore the original double-dashed separators without narrowing tool columns.
     """
     if not run_metadata_lines and not tools_header:
         return None
 
-    # LEFT: Run Metadata (preserve separators from TSV)
+    page_w, _ = layout.page_size
+    usable = page_w - (layout.left_margin + layout.right_margin)
+    left_ratio = max(0.05, min(0.95, layout.left_panel_ratio))
+    right_ratio = max(0.05, min(0.95, layout.right_panel_ratio))
+    total = left_ratio + right_ratio
+    right_width = usable * right_ratio / total
+    col_widths = [usable * left_ratio / total, right_width / 2, right_width / 2]
+
+    def text_width(text, style_name):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        style = styles[style_name]
+        return stringWidth(str(text), style.fontName, style.fontSize)
+
+    def separator(width):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        style = styles["Separator"]
+        count = max(3, int((width - 1) / stringWidth("=", style.fontName, style.fontSize)))
+        return Paragraph("=" * count, style)
+
+    # LEFT: Run Metadata. Long ASCII separators must not force extra wrapped lines.
     left_flow: List[Union[Paragraph, Table]] = []
     if run_metadata_lines:
-        left_flow.append(Paragraph("Run Metadata", styles["Header"]))
-        for ln in run_metadata_lines:
-            if _is_separator(ln):
-                left_flow.append(Paragraph(ln.strip(), styles["Separator"]))
-            else:
-                left_flow.append(Paragraph(str(ln), styles["HeaderBlock"]))
+        metadata = [str(ln) for ln in run_metadata_lines if str(ln).strip() and not _is_separator(ln)]
+        metadata_width = min(col_widths[0] - 12, max(
+            [text_width(ln, "HeaderBlock") for ln in metadata] or [0]
+        ))
+        left_flow.append(Paragraph("Run Metadata", styles["HeaderRight"]))
+        left_flow.append(separator(metadata_width))
+        for ln in metadata:
+            left_flow.append(Paragraph(escape(ln), styles["HeaderBlock"]))
+        left_flow.append(separator(metadata_width))
 
-    # RIGHT: Tools & Cutoffs (explicit separators under title and after the list)
-    right_flow: List[Union[Paragraph, Table]] = []
-    if tools_header:
-        right_flow.append(Paragraph("Tool version Numbers & QC Cutoffs", styles["HeaderRight"]))
-        right_flow.append(Paragraph("=" * 35, styles["Separator"]))  # under title
+    # RIGHT: tools and thresholds occupy independent, top-aligned columns.
+    software, datasets, thresholds = _report_header_groups(tools_header)
 
-        # Build tool table with Paragraph cells (same leading as metadata)
+    def pair_panel(title, pairs, available_width):
+        panel: List[Union[Paragraph, Table]] = []
+        if not pairs:
+            return panel
+        label_width = min(available_width * .80, max(text_width(k, "ToolLabel") for k, v in pairs) + 12)
+        value_width = min(available_width - label_width, max(text_width(v, "ToolValue") for k, v in pairs) + 1)
+        section_width = label_width + value_width
+        panel.append(Paragraph(title, styles["HeaderRight"]))
+        panel.append(separator(section_width))
         tool_data = [
-            [Paragraph(str(k), styles["HeaderBlock"]),
-             Paragraph(str(v), styles["HeaderBlock"])]
-            for (k, v) in tools_header
+            [Paragraph(escape(k), styles["ToolLabel"]),
+             Paragraph(escape(v), styles["ToolValue"])]
+            for k, v in pairs
         ]
-        tool_table = Table(tool_data, hAlign="LEFT")
+        wide_policy_rows = []
+        for index, (label, value) in enumerate(pairs):
+            if label.casefold() == "minimum depth" and ";" in value:
+                # A multi-tier policy needs the panel width, not a narrow
+                # version-number cell. Keep all other label/value rows intact.
+                tool_data[index] = [Paragraph(escape(label) + ": " + escape(value),
+                                             styles["ToolValue"]), ""]
+                wide_policy_rows.append(index)
+        tool_table = Table(tool_data, colWidths=[label_width, value_width],
+                           rowHeights=[styles["ToolValue"].leading if not k and not v else None for k, v in pairs],
+                           hAlign="LEFT")
         tool_table.setStyle(TableStyle([
             ("ALIGN", (0,0), (-1,-1), "LEFT"),
             ("VALIGN", (0,0), (-1,-1), "TOP"),
@@ -343,35 +470,85 @@ def _build_dual_header_band(
             ("TOPPADDING", (0,0), (-1,-1), 0),
             ("BOTTOMPADDING", (0,0), (-1,-1), 0),  # compact vertically
         ]))
-        right_flow.append(tool_table)
-        right_flow.append(Paragraph("=" * 35, styles["Separator"]))  # after list
+        for index in wide_policy_rows:
+            tool_table.setStyle(TableStyle([("SPAN", (0, index), (1, index))]))
+        panel.append(tool_table)
+        panel.append(separator(section_width))
+        return panel
 
-    # Parent 2-col table pushed to the right edge for tools
-    page_w, _ = layout.page_size
-    usable = page_w - (layout.left_margin + layout.right_margin)
+    versions = software + datasets
+    tools_flow = pair_panel("Tool Versions", versions, col_widths[1] - 12)
+    thresholds_flow = pair_panel("QC Thresholds", thresholds, col_widths[2])
 
-    left_ratio = max(0.05, min(0.95, layout.left_panel_ratio))
-    right_ratio = max(0.05, min(0.95, layout.right_panel_ratio))
-    total = left_ratio + right_ratio or 1.0
-    left_ratio /= total
-    right_ratio /= total
-
-    col_widths = [usable * left_ratio, usable * right_ratio]
-
-    parent = Table([[left_flow, right_flow]], colWidths=col_widths)
+    parent = Table([[left_flow, tools_flow, thresholds_flow]], colWidths=col_widths)
     parent.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "TOP"),
         ("ALIGN", (0,0), (-1,-1), "LEFT"),
         ("LEFTPADDING", (0,0), (-1,-1), 0),
         ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (1,-1), 12),
         ("TOPPADDING", (0,0), (-1,-1), 0),
         ("BOTTOMPADDING", (0,0), (-1,-1), 0),
     ]))
     return parent
 
 
-def _build_table(df: pd.DataFrame, layout: LayoutConfig) -> Table:
+def _load_lambda_evidence(df, result_root):
+    """Read only retained per-control metrics; never infer coverage from identity."""
+    from bactipipe.lambda_control import is_lambda_control
+    evidence = {}
+    for _, row in df.iterrows():
+        sample = str(row.get("Sample ID", ""))
+        if not is_lambda_control(row.get("Expected organism")):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", sample) or sample in {".", ".."}:
+            continue
+        path = result_root / "qc_out" / sample / "lambda_control" / "result.json"
+        try:
+            payload = json.loads(path.read_text())
+            if isinstance(payload, dict):
+                evidence[sample] = payload
+        except (OSError, ValueError):
+            # Historical standalone TSVs may not have their companion metrics.
+            # Report unavailable coverage instead of inventing a measurement.
+            continue
+    return evidence
+
+
+def _lambda_match_cell(identity, evidence, styles, layout):
+    def numeric(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and 0 <= number <= 100 else None
+
+    identity = numeric(evidence.get("identity_percent", identity))
+    coverage = numeric(evidence.get("reference_coverage_percent"))
+
+    def metric(value, threshold):
+        text = f"{value:,.2f}%" if value is not None else "N/A"
+        minimum = numeric(threshold)
+        if value is not None and minimum is not None and value < minimum:
+            return f'<font color="{layout.fail_color.hexval()}">{text}</font>'
+        return text
+
+    id_text = metric(identity, evidence.get("minimum_identity_percent"))
+    cov_text = metric(coverage, evidence.get("minimum_coverage_percent"))
+    style = ParagraphStyle("LambdaMatch", parent=styles["TableBodyPara"], alignment=TA_CENTER)
+    return Paragraph(id_text + '<br/><font size="6">Coverage: ' + cov_text + '</font>', style)
+
+
+def _build_table(df: pd.DataFrame, layout: LayoutConfig, lambda_evidence=None) -> Table:
+    # Machine-readable isolate flags travel in TSVs, not as extra report columns.
+    df = df.drop(columns=["Isolate QC", "Control QC"], errors="ignore")
     styles = _styles(layout)
+    from xml.sax.saxutils import escape
+    from bactipipe.qc_status import organism_input
+    from bactipipe.lambda_control import is_lambda_control
+
+    if "Expected organism" in df.columns:
+        df = df.iloc[sorted(range(len(df)), key=lambda i: not is_lambda_control(df.iloc[i]["Expected organism"]))]
 
     # Headers: wrap except reserved organism columns
     wrapped_headers = []
@@ -386,10 +563,23 @@ def _build_table(df: pd.DataFrame, layout: LayoutConfig) -> Table:
     data = [wrapped_headers]
     org_cols = set(layout.reserved_cols)  # usually {2, 3}
     for row in df.astype(str).values.tolist():
+        control = "Expected organism" in df.columns and is_lambda_control(row[df.columns.get_loc("Expected organism")])
+        sample = row[df.columns.get_loc("Sample ID")] if "Sample ID" in df.columns else ""
         r = []
         for i, cell in enumerate(row):
-            if i in org_cols:
-                r.append(Paragraph(cell, styles["TableBodyPara"]))
+            if control and df.columns[i] == "Expected organism":
+                cell = "Lambda (Control)"
+            if control and df.columns[i] in {"CheckM completeness", "CheckM contamination"}:
+                cell = "N/A"
+            if df.columns[i] == "Expected organism" and organism_input(cell)["warning"]:
+                if not control:
+                    cell = f"{cell or 'Not supplied'} (! analyzed as Unknown)"
+            if df.columns[i] in {"Mean quality", "Coverage Depth", "CheckM completeness", "CheckM contamination"} and cell.strip().upper() in {"N/A", "NA", "NAN", ""}:
+                cell = "N/A" if control and df.columns[i].startswith("CheckM") else "Not assessed"
+            if control and df.columns[i] == "% Match":
+                r.append(_lambda_match_cell(cell, (lambda_evidence or {}).get(sample, {}), styles, layout))
+            elif i in org_cols:
+                r.append(Paragraph(escape(cell), styles["TableBodyPara"]))
             else:
                 r.append(cell)
         data.append(r)
@@ -419,6 +609,15 @@ def _build_table(df: pd.DataFrame, layout: LayoutConfig) -> Table:
         style.add("BACKGROUND", (0,i), (-1,i),
                   colors.HexColor("#fcfcfc") if i % 2 == 1 else colors.white)
 
+    # Keep the compact Lambda coverage annotation on one line without widening
+    # the shared Match column or changing the other samples' cell padding.
+    if "% Match" in df.columns and "Expected organism" in df.columns:
+        match_idx = df.columns.get_loc("% Match")
+        for row_idx, expected in enumerate(df["Expected organism"], start=1):
+            if is_lambda_control(expected):
+                style.add("LEFTPADDING", (match_idx, row_idx), (match_idx, row_idx), 3)
+                style.add("RIGHTPADDING", (match_idx, row_idx), (match_idx, row_idx), 3)
+
     # Match header alignment to body
     n_cols = df.shape[1]
     style.add("ALIGN", (0,0), (-1,0), "CENTER")  # default header center
@@ -436,6 +635,8 @@ def _build_table(df: pd.DataFrame, layout: LayoutConfig) -> Table:
                 style.add("TEXTCOLOR", (oq_idx, r_idx), (oq_idx, r_idx), layout.pass_color)
             elif v == "fail":
                 style.add("TEXTCOLOR", (oq_idx, r_idx), (oq_idx, r_idx), layout.fail_color)
+            elif v == "review":
+                style.add("TEXTCOLOR", (oq_idx, r_idx), (oq_idx, r_idx), colors.HexColor("#946200"))
 
     t.setStyle(style)
     return t
@@ -455,6 +656,7 @@ def _render_pdf_common(
     tools_header: Optional[Sequence[Tuple[str, str]]],
     layout: LayoutConfig,
     run_name: Optional[str],  # used in footer
+    lambda_evidence: Optional[dict] = None,
 ) -> str:
     styles = _styles(layout)
 
@@ -492,7 +694,7 @@ def _render_pdf_common(
 
     # Main QC table
     story.append(Paragraph("Quality Summary Table", styles["Header"]))
-    story.append(_build_table(df, layout))
+    story.append(_build_table(df, layout, lambda_evidence=lambda_evidence))
 
     # Footer with run name + page number
     footer_func = _page_footer_factory(run_name)

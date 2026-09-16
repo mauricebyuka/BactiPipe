@@ -264,6 +264,10 @@ def excel_reader(filepath: str, platform: str = "nanopore"):
     #    if the “header” column j is blank for all data rows
     #    but j+1 has real values, shift to j+1
     for idx, j in enumerate(col_positions):
+        if needed[idx] == "Bacteria Species":
+            # An intentionally blank organism column is not a shifted barcode
+            # or another metadata column. Keep its missing-input provenance.
+            continue
         block = raw.iloc[data_start : data_start + 10, j]
         # is it entirely blank?
         if all(pd.isna(x) or str(x).strip() == "" for x in block):
@@ -281,14 +285,24 @@ def excel_reader(filepath: str, platform: str = "nanopore"):
     # 7) Clean up every cell
     df = df.apply(lambda col: col.map(normalize))
 
+    # The controlled workbook contains reagent/protocol sections below the
+    # sample table. A blank sample row ends that table; dropping blanks first
+    # would join those unrelated sections back into the sample list. Barcode
+    # presence must not determine this boundary (uploaded samples may omit it).
+    table_started = False
+    for position, (_, row) in enumerate(df.iterrows()):
+        has_sample_fields = bool(row["Accession Number"] or row["Bacteria Species"])
+        if table_started and not has_sample_fields:
+            df = df.iloc[:position].copy()
+            break
+        if has_sample_fields:
+            table_started = True
+
     if "Other Bacteria Species" in df.columns:
         other_mask = df["Bacteria Species"].str.casefold() == "other"
-        missing_other = other_mask & ~df["Other Bacteria Species"].astype(bool)
-        if missing_other.any():
-            samples = ", ".join(df.loc[missing_other, "Accession Number"].tolist())
-            raise ValueError(f"Other Bacteria Species is required for: {samples}.")
-        df.loc[other_mask, "Bacteria Species"] = df.loc[
-            other_mask, "Other Bacteria Species"
+        supplied_other = other_mask & df["Other Bacteria Species"].astype(bool)
+        df.loc[supplied_other, "Bacteria Species"] = df.loc[
+            supplied_other, "Other Bacteria Species"
         ]
 
     # 8) Illumina rows require a valid well. Nanopore barcode is optional for
@@ -297,7 +311,7 @@ def excel_reader(filepath: str, platform: str = "nanopore"):
         df = df[df[idx_col].astype(bool) & df[idx_col].str.match(pattern)]
 
     # 9) Drop any row missing the two critical fields
-    df = df[df["Accession Number"].astype(bool) & df["Bacteria Species"].astype(bool)]
+    df = df[df["Accession Number"].astype(bool)]
 
     # 10) Return a list of TAB‐joined strings
 

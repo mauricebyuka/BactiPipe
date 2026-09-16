@@ -68,6 +68,8 @@ def _iter_fastq_with_progress(fastq_path, desc):
                 if not title:
                     break
                 seq = r(); plus = r(); qual = r()
+                if not title.startswith(b'@') or not plus.startswith(b'+') or not seq.strip() or len(seq.rstrip(b'\r\n')) != len(qual.rstrip(b'\r\n')):
+                    raise ValueError('Malformed or truncated FASTQ record')
 
                 cur = tell(); delta = cur - prev
                 if delta > 0:
@@ -136,6 +138,8 @@ class ProcQuality:
                     # Vectorized Phred+33 decode
                     # Strip newlines but keep as bytes for frombuffer
                     qv = np.frombuffer(qual.rstrip(b"\r\n"), dtype=np.uint8).astype(np.int32) - 33
+                    if np.any(qv < 0) or np.any(qv > 93):
+                        raise ValueError('Invalid Phred+33 quality character')
                     L = qv.size
 
                     # Grow positional arrays if this read is longer than what we've seen

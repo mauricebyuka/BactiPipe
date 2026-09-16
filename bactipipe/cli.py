@@ -29,6 +29,20 @@ def main():
     qc-nanopore        :  Run the Nanopore QC pipeline.
     relate             :  Run genome typing and strain relatedness analysis.
     detect             :  Detect virulence and antimicrobial resistance genes in assemblies.
+    identify           :  Identify an assembled bacterial genome with ANI/AF evidence.
+    place-assembly     :  Run cached marker placement separately from QC reporting.
+    render-placement   :  Redraw retained tree and ANI figures without reanalysis.
+    build-identify-db  :  Build an inactive reviewed species-reference candidate.
+    plan-identify-refs :  Propose canonical references from NCBI assembly reports.
+    plan-identify-inventory :  Propose veterinary and near-neighbor assembly accessions.
+    fetch-identify-reports :  Fetch current NCBI reports for proposed assemblies.
+    reconcile-identify-inventory :  Resolve current accessions and canonical fallbacks.
+    download-identify-refs :  Download reconciled assemblies and write a reviewed manifest.
+    augment-identify-inventory :  Add audited controlled-gap reference candidates.
+    write-identify-manifest :  Validate downloads and write the final candidate manifest.
+    validate-identify-manifest :  Verify all candidate references, roles, and checksums.
+    validate-identify-db :  Verify an immutable production or candidate database.
+    prepare-speciesfinder-db :  Prepare the official bacterial SpeciesFinder candidate database.
 
     Package / Environment Management:
     check-updates      :  Check for available updates to environments and databases.
@@ -97,6 +111,20 @@ def main():
         "qc-nanopore": os.path.join(script_dir, "run_nanopore_qc.py"),
         "relate": os.path.join(script_dir, "type_genomes.py"),
         "detect": os.path.join(script_dir, "run_traits.py"),
+        "identify": os.path.join(script_dir, "identify_species.py"),
+        "place-assembly": os.path.join(script_dir, "place_assembly.py"),
+        "render-placement": os.path.join(script_dir, "render_placement.py"),
+        "build-identify-db": os.path.join(script_dir, "build_species_database.py"),
+        "plan-identify-refs": os.path.join(script_dir, "plan_species_references.py"),
+        "plan-identify-inventory": os.path.join(script_dir, "plan_species_inventory.py"),
+        "fetch-identify-reports": os.path.join(script_dir, "fetch_species_reports.py"),
+        "reconcile-identify-inventory": os.path.join(script_dir, "reconcile_species_inventory.py"),
+        "download-identify-refs": os.path.join(script_dir, "download_species_references.py"),
+        "augment-identify-inventory": os.path.join(script_dir, "augment_species_inventory.py"),
+        "write-identify-manifest": os.path.join(script_dir, "write_species_reference_manifest.py"),
+        "validate-identify-manifest": os.path.join(script_dir, "validate_species_reference_manifest.py"),
+        "validate-identify-db": os.path.join(script_dir, "validate_species_database.py"),
+        "prepare-speciesfinder-db": os.path.join(script_dir, "prepare_speciesfinder_database.py"),
     }
 
     if cmd not in script_map and cmd not in tool_manage_commands:

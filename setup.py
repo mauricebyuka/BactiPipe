@@ -20,6 +20,7 @@ setup(
         "psutil>=7.0",
         "pyfastx",
         "reportlab>=4.4",
+        "SpeciesFinder==4.0.4",
         "tabulate>=0.9",
         "textwrap3>=0.9",
         "tqdm>=4.67",

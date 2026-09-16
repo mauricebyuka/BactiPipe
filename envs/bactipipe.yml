@@ -12,12 +12,22 @@ dependencies:
   - awscli=1.42.6
   - boto3=1.40.6
   - biopython=1.85
+  # Required for low-complexity masking during custom Kraken2 database builds.
+  - blast=2.16.0
   - checkm-genome=1.2.4
   - coreutils=9.5
   - fastp=1.0.1
   - filtlong=0.2.1
   - flye=2.9.6
   - kmerfinder=3.0.2
+  # SpeciesFinder is installed from PyPI; pin KMA explicitly instead of
+  # relying on the legacy KmerFinder package's transitive dependency.
+  - kma=1.6.13
+  - kraken2=2.1.6
+  - minimap2=2.30
+  # Maintenance-only accession metadata and genome package retrieval.
+  - ncbi-datasets-cli=18.35.0
+  - samtools=1.22.1
   - matplotlib=3.10.5
   - nanoplot=1.46.1
   - numpy=2.3.3
@@ -38,6 +48,7 @@ dependencies:
   - tabulate=0.10.0
 
   - pip:
+      - SpeciesFinder==4.0.4
       - cgecore==2.0.1
       - ete3==3.1.3
       - openpyxl==3.1.5

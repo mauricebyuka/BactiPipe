@@ -2,11 +2,12 @@
 
 **BactiPipe** was developed and is actively used by the **NGS section of the Penn State Animal Diagnostic Laboratory** to bring **consistency** to the analysis of **BACTERIAL** whole-genome sequencing (WGS) data. Multiple tools and parameters are available for genomic data analysis but this flexibility often leads to variability in results from run to run. In diagnostic laboratories, such variability may compromize one of the most critical aspects of quality control in a diagnostic setting: **reproducibility and standardization**. BactiPipe addresses this challenge by wrapping together the core tools used in our laboratory with carefully chosen and fixed parameters, ensuring consistent analysis across all sequencing runs.  
 
-BactiPipe provides **end-to-end quality control and genome assembly workflows** for both **Illumina** and **Oxford Nanopore** sequencing data. It automates read QC, genome assembly, organism identification, and assembly quality checks using tools such as **fastp, filtlong, Spades, Unicycler, Flye, KmerFinder, Kraken2,** and **CheckM**. The pipeline supports data from **local directories, network-mounted storage, and Amazon S3**, making it suitable for both on-premises and cloud-based environments. Outputs include detailed logs, quality metrics plots, assembled genomes, and comprehensive QC summary reports.  
+BactiPipe provides **end-to-end quality control and genome assembly workflows** for both **Illumina** and **Oxford Nanopore** sequencing data. It automates read QC, genome assembly, organism identification, and assembly quality checks using tools such as **fastp, filtlong, Spades, Unicycler, Flye, skani, SpeciesFinder/KMA,** and **CheckM**. KmerFinder remains the legacy production identifier while the new workflow is validated. The pipeline supports data from **local directories, network-mounted storage, and Amazon S3**, making it suitable for both on-premises and cloud-based environments. Outputs include detailed logs, quality metrics plots, assembled genomes, and comprehensive QC summary reports.
 
 For a detailed description of the pipeline, workflows, and usage examples, please see the [**BactiPipe Wiki Page**](https://github.com/ADL-genomics/BactiPipe/wiki).  
 
-The current CLI exposes four analysis commands:
+The current CLI exposes five analysis commands plus reference-planning and
+inactive candidate-building commands:
 
 - `bactipipe qc-illumina` and `bactipipe qc-nanopore` perform read QC, assembly,
   identification, and assembly QC.
@@ -14,6 +15,41 @@ The current CLI exposes four analysis commands:
   SKA, and cgMLST analysis on a related cohort of assembled genomes.
 - `bactipipe detect` reports AMR determinants and virulence genes from assembled
   genomes.
+- `bactipipe identify` runs the candidate evidence-based species-identification
+  workflow against an explicitly selected database version.
+- `bactipipe plan-identify-inventory` creates a bounded assembly-accession
+  proposal from pinned GTDB metadata and the controlled veterinary catalog.
+- `bactipipe fetch-identify-reports` retrieves current NCBI assembly metadata
+  for that proposal in resumable batches.
+- `bactipipe reconcile-identify-inventory` resolves newer accession versions,
+  suppressed records, canonical fallbacks, and taxonomy-review candidates.
+- `bactipipe augment-identify-inventory` adds only exact-taxid, quality-passing
+  replacements for controlled species that remain absent after reconciliation.
+- `bactipipe download-identify-refs` retrieves accepted multi-contig assemblies
+  in resumable batches and emits a checksum-verified reviewed manifest.
+- `bactipipe build-identify-db` builds an immutable inactive species-reference
+  candidate from a reviewed manifest.
+- `bactipipe prepare-speciesfinder-db` converts the verified official bacterial
+  SpeciesFinder/KMA files into an immutable, inactive BactiPipe database version.
+- `bactipipe validate-identify-db` verifies either supported immutable database
+  contract and its activation state.
+
+The new identification workflow is not yet the production QC default. The
+current candidate uses only the assembly FASTA for SpeciesFinder/KMA to nominate a bounded set of taxa and
+exact database templates, then uses whole-genome ANI/aligned fraction for the
+actual identification. There is no FASTQ nomination fallback or additional read-based discovery screen.
+For nomination only, contigs are divided into non-overlapping pieces of at most
+20,000 bp on both platforms, retaining short contigs and every final tail.
+ANI, assembly metrics and downstream typing still use the original assembly.
+The derived FASTA is removed after nomination; checksums and fragment coordinates
+remain in `species_identification/<sample>/speciesfinder_query/`.
+Read-level support for assembly-nominated taxa is confirmed by competitive mapping,
+and run-wide donor/recipient comparison distinguishes weak possible multiplex
+carryover from secondary signals requiring review or suspected culture contamination.
+The evidence remains available. The workflow can place unresolved non-mixed
+assemblies with GTDB bac120 markers. The older custom Kraken candidate remains
+available only for comparison and rollback. See
+[`docs/species_identification.md`](docs/species_identification.md).
 
 Run `bactipipe <command> --help` for the current input contract and options.
 
@@ -21,6 +57,65 @@ For either QC command, repeat `--only-sample SAMPLE_ID` to select samples and
 add `--update-existing` to safely replace only those samples in an existing
 run output. BactiPipe stages the reanalysis separately and publishes it with a
 directory swap; failed reanalysis leaves the existing output unchanged.
+
+For controlled Nanopore reanalysis, `--input-run-name SOURCE_RUN` reuses that
+physical input directory while `--run_name` continues to name the independent
+output. This is primarily used by the web application's Admin-only benchmark
+workflow.
+
+## Controlled organism sizes
+
+The QC sample sheet accepts the organism names in
+`bactipipe/data/pathogenic_bacteria.txt` plus `Lambda` and `Unknown`. Matching
+ignores capitalization and extra whitespace, but BactiPipe does not guess at
+unsupported taxonomic names. Unrecognized/blank entries use Unknown mode and
+retain an input warning; they do not halt assembly.
+
+Each controlled organism is resolved once and the exact taxid, reference
+accession, genome size, catalog version, and catalog checksum used by the run
+are recorded in `sample_execution_plan.tsv`. Illumina assemblers do not receive
+a genome-size argument. Final reported depth on both platforms is QC-retained
+read bases divided by actual assembly length, regardless of identification.
+Unknown Nanopore assemblies use the bounded adaptive assembly workflow.
+
+### Illumina filtering and depth
+
+Raw mean quality is the base-weighted arithmetic mean of Phred scores across
+both mates combined. Filtering runs only below `--minqual + 1` (default: below
+Q29); exactly Q29 skips filtering. When needed, fastp applies a per-read mean
+Q gate of `--minqual` (rounded upward if fractional), its normal adapter/quality
+filters, and no minimum length. Empty output or malformed/unbalanced pairs fail
+the sample. All subsequent QC, assembly and read evidence use this selected
+dataset, which must meet the configured sample mean Q (default Q28).
+
+Depth is selected read bases / total assembled FASTA length, not mapped depth
+or a catalog-size estimate. No estimated-depth gate prevents assembly. Required
+depth is 30X at mean Q≥30, 40X at 29≤Q<30, and 50X below Q29; confidently
+identified E. coli requires another 10X. Expected and closest-reference names
+do not add this requirement. Cohort review and selective retries update the
+requirement when the identification changes. Decisions use unrounded values.
+
+`qc_out/<sample>/illumina_read_selection.json` retains raw/selected counts,
+full-precision quality, filtering command/version and input signatures.
+`depth_metrics.json` records assembly-based depth and its threshold. Filtered
+FASTQs are temporary; compact fastp reports/logs remain. Raw FASTQs are untouched.
+
+### Illumina sample parallelism
+
+SKESA and SPAdes now run read QC/assembly for up to three samples concurrently.
+`--threads` is the total run CPU budget, capped by affinity/container quota;
+`--sample-threads` defaults to 20 per sample and `--sample-jobs` defaults to 3.
+Available CPU and RAM can reduce concurrency automatically. An optional
+`--memory-gb` further limits the preparation budget. Use `--sample-jobs 1
+--sample-threads 60 --threads 60` for a serial 60-thread comparison.
+
+Identification remains serial after preparation; CheckM, cohort checks and final
+reporting remain batch-wide. Failed samples do not stop successful samples.
+`illumina_resources.json` and sample worker JSON/log files record allocations
+and outcomes. Assembly cache identity includes thread/memory settings.
+SPAdes receives a memory limit; SKESA's memory flag only applies in its
+sorted-counter mode, so its normal mode still requires peak-memory monitoring.
+Unicycler stays serial; Nanopore/downstream behavior is unchanged.
 
 The installed application version is available through either alias:
 
@@ -37,6 +132,7 @@ then install the exact legacy CGE/SeqSero wrappers without their obsolete
 dependency metadata:
 
 ```bash
+mamba env create -f envs/bactipipe-kma.yml
 mamba env create -f envs/genepid.yml
 bash envs/install_genepid_tools.sh genepid
 mamba env create -f envs/viramr.yml

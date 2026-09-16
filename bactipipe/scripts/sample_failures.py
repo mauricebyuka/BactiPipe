@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import json
+import math
 from pathlib import Path
 
 
@@ -56,6 +58,19 @@ def publish_failures(
         for sample_id in expected_organisms:
             if sample_id not in failures or sample_id in existing:
                 continue
+            depth, depth_verdict, threshold = "N/A", "N/A", required_depth
+            # If identification failed after successful assembly, preserve measured
+            # depth while retaining the sample's independent execution failure.
+            if failures[sample_id][0] == "organism_identification":
+                try:
+                    audit = json.loads((outdir / "qc_out" / sample_id / "depth_metrics.json").read_text())
+                    value = float(audit["depth"])
+                    if math.isfinite(value) and value >= 0:
+                        depth = f"{value:.2f}X"
+                        depth_verdict = audit["verdict"]
+                        threshold = audit["minimum_depth"]
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass
             writer.writerow(
                 (
                     sample_id,
@@ -64,9 +79,9 @@ def publish_failures(
                     expected_organisms[sample_id],
                     "Analysis failed",
                     "0",
-                    "N/A",
-                    required_depth,
-                    "Fail",
+                    depth,
+                    threshold,
+                    depth_verdict,
                     "Fail",
                 )
             )

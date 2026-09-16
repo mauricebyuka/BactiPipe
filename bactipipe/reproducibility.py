@@ -25,6 +25,16 @@ def database_identity_label(database_root: str | Path | None = None) -> str:
     return str(identity.get("version") or identity.get("name") or "Unversioned")
 
 
+def database_log_record(species_database_root: str | Path | None = None) -> str:
+    """Compact report headers must not discard detailed database provenance."""
+    identities = {"reference_bundle": database_identity()}
+    if species_database_root:
+        identities["species_identification"] = database_identity(species_database_root)
+    return "Database provenance (bundle inventory, not a list of invoked components): " + json.dumps(
+        identities, sort_keys=True
+    )
+
+
 def _source_identity(package_name: str, version: str) -> dict[str, Any]:
     payload: dict[str, Any] = {"version": version}
     record = _source_lock_record(package_name)

@@ -8,17 +8,44 @@ import socket
 import argparse
 import subprocess
 from datetime import datetime
+from pathlib import Path
 from bactipipe.scripts import nano_qc
 from bactipipe.scripts import process_data
 from bactipipe.scripts import find_organism
 from bactipipe.scripts import sample_failures as sample_failure_audit
 from bactipipe.scripts.sample_update import run_qc_sample_update
-from importlib.resources import files as resource_files
 from bactipipe.scripts.utils import compress_qc_fastqs, logger, pipeheader, excel_reader, time_print, simple_print
+from bactipipe.genome_sizes import GenomeSizeCatalog
+from bactipipe.assembly_depth import assembly_depth
+from bactipipe.lambda_control import is_lambda_control, control_summary_row, assess_control, add_control_arguments
+from bactipipe.adaptive_assembly import adaptive_flye
+from bactipipe.illumina_parallel import cpu_budget, available_memory_gb, atomic_json
+from bactipipe.nanopore_parallel import plan_flye_resources, run_assembly_jobs
+from bactipipe.progress import emit
+from dataclasses import asdict
+from bactipipe.scripts.qc_plan import (
+    NanoporeAssemblyJob,
+    NanoporeQCJob,
+    bounded_worker_count,
+    nanopore_qc_failure_reason,
+    write_execution_plan,
+)
 from tqdm.contrib.concurrent import process_map
 from collections import OrderedDict
 from bactipipe.__version__ import __version__
-from bactipipe.reproducibility import database_identity_label
+from bactipipe.reproducibility import database_identity, database_identity_label, database_log_record
+from bactipipe.species_workflow import (
+    command_version,
+    identification_database_kind,
+    identification_database_version,
+    identify_assembly,
+    legacy_summary_fields,
+    python_package_version,
+)
+from bactipipe.batch_species import (
+    reconcile_batch_identifications,
+    update_summary_identifications,
+)
 
 
 class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
@@ -48,6 +75,14 @@ required_args.add_argument("-n", "--name",
 required_args.add_argument("-r", "--run_name",
                     help="Run name (Run ID)", required=True)
 
+optional_args.add_argument(
+    "--input-run-name",
+    help=(
+        "Optional physical source-run directory name. Outputs continue to use "
+        "--run_name; intended for controlled reanalysis without copying FASTQs."
+    ),
+)
+
 required_args.add_argument("-l", "--sample_sheet",
                     help="A two- or three-column file with sample, organism species, and optional barcode. Without a barcode, FASTQs are read from a folder named for the sample.", required=True)
 
@@ -66,12 +101,35 @@ optional_args.add_argument("--min-read-length", help="Minimum read length retain
 optional_args.add_argument("--min_completeness", help="Minimum CheckM completeness percentage.", default=90, type=float)
 optional_args.add_argument("--max_contamination", help="Maximum CheckM contamination percentage.", default=10, type=float)
 optional_args.add_argument(
+    "--species-database-root",
+    help=(
+        "Reviewed BactiPipe species-identification database version. The new "
+        "ANI workflow remains disabled when omitted."
+    ),
+)
+optional_args.add_argument(
+    "--species-gtdb-metadata",
+    help="GTDB metadata TSV used to label an unresolved sample's bac120 tree.",
+)
+optional_args.add_argument(
+    "--species-gtdbtk-conda-env",
+    default="gtdbtk",
+    help="Conda environment containing GTDB-Tk for unresolved samples.",
+)
+optional_args.add_argument(
+    "--allow-candidate-species-database",
+    action="store_true",
+    help="Permit an inactive species database for controlled benchmarking.",
+)
+optional_args.add_argument(
     "--only-sample",
     action="append",
     default=[],
     metavar="SAMPLE_ID",
     help="Process only this sample-sheet sample. Repeat for multiple samples.",
 )
+optional_args.add_argument("--defer-qc-pdf", action="store_true",
+                           help="Write QC tables but defer PDF publication to a follow-up workflow.")
 optional_args.add_argument(
     "--update-existing",
     action="store_true",
@@ -94,63 +152,71 @@ optional_args.add_argument("-h", "--help",
                            action="help",
                            help="Show this help message and exit.")
 
+add_control_arguments(optional_args)
 args = parser.parse_args()
+
+species_identification_enabled = bool(args.species_database_root)
+if args.species_gtdb_metadata and not species_identification_enabled:
+    parser.error("--species-gtdb-metadata requires --species-database-root")
 
 # Version of BactiPipe
 bactipipe_version = f"v{__version__}"
 
     # Function to run quality control for a single sample
-def _process_sample(line):
-
-    sample, organism, barcode = line.strip().split('\t')
-    barcode = barcode.replace("NB", "barcode")
-    genome_size = _genome_size_for(organism)
-    raw_folder = os.path.join(source, barcode)
-    output_fastq = f"{sample}.fastq"
-    output_dir = os.path.join(qc_out, sample)
+def _process_sample(job):
+    sample = job.sample
+    output_dir = job.output_dir
+    failure_path = os.path.join(output_dir, "analysis_failure.txt")
+    if os.path.isfile(failure_path):
+        os.remove(failure_path)
 
     # Run QC with controlled CPU allocation
     if not sample.startswith("#"):
         nano_qc.qc_nano(
-            raw_folder=raw_folder,
-            genome_size=genome_size,
-            min_avg_quality=minqual,
-            min_read_length=args.min_read_length,
-            min_coverage=mincov,
-            desired_coverage=300,
-            output_fastq=output_fastq,
+            raw_folder=job.raw_folder,
+            genome_size=job.genome_size_bp,
+            min_avg_quality=job.min_avg_quality,
+            min_read_length=job.min_read_length,
+            min_coverage=job.min_coverage,
+            desired_coverage=job.desired_coverage,
+            output_fastq=job.output_fastq,
             output_dir=output_dir,
-            cpus=str(cpus_per_sample),
-            s3=args.use_s3,
-            bucket=args.bucket if args.use_s3 else None,
+            cpus=str(job.cpus),
+            s3=job.use_s3,
+            bucket=job.bucket,
             logfile=os.path.join(output_dir, f"{sample}_qc_nano.log")
         )
         metrics_path = os.path.join(output_dir, "quality_metrics.txt")
-        required_labels = ("Trimmed Total Bases:", "Trimmed Mean Read Quality:")
         metrics_text = ""
         if os.path.isfile(metrics_path):
             with open(metrics_path, "r", encoding="utf-8", errors="replace") as handle:
                 metrics_text = handle.read()
-        if (
-            not all(label in metrics_text for label in required_labels)
-            or not os.path.isfile(os.path.join(output_dir, output_fastq))
-        ):
+        failure_reason = nanopore_qc_failure_reason(
+            metrics_text,
+            genome_size_bp=job.genome_size_bp,
+            minimum_quality=job.min_avg_quality,
+            minimum_coverage=job.min_coverage,
+        )
+        if not os.path.isfile(os.path.join(output_dir, job.output_fastq)):
+            failure_reason = "Read quality filtering did not produce a filtered FASTQ."
+        if failure_reason:
             with open(
-                os.path.join(output_dir, "analysis_failure.txt"),
+                failure_path,
                 "w",
                 encoding="utf-8",
             ) as handle:
-                handle.write("Read quality filtering did not produce complete QC outputs.\n")
+                handle.write(failure_reason + "\n")
 
 
-def process_sample(line):
+def process_sample(job):
     """Keep an unexpected worker exception isolated to its sample."""
 
-    sample = line.strip().split("\t", 1)[0]
+    sample = job.sample
+    emit('read_qc', sample=sample)
     try:
-        return _process_sample(line)
+        return _process_sample(job)
     except Exception as exc:
-        output_dir = os.path.join(qc_out, sample)
+        output_dir = job.output_dir
         os.makedirs(output_dir, exist_ok=True)
         reason = f"Unexpected QC worker failure: {exc}"
         with open(
@@ -160,38 +226,84 @@ def process_sample(line):
         ) as handle:
             handle.write(reason + "\n")
         return None
+    finally:
+        emit('read_qc', 'failed' if os.path.isfile(os.path.join(job.output_dir, 'analysis_failure.txt')) else 'completed', sample=sample)
 
 # Function for genome assembly for one sample
 if args.assembler:
     assembler = args.assembler.strip().lower()
 else:
     assembler = "flye"
-def assemble_sample(assembly_input):
-    sample = assembly_input[0]
-    fastq = assembly_input[1]
-    genome_size = assembly_input[2]
+def assemble_sample(job):
+    sample = job.sample
     # Assemble the genomes of the samples that passed the quality control
-    assembly_dir = os.path.join(outDir, "assemblies")
-    genome = os.path.join(assembly_dir, "genomes", f"{sample}.fasta")
+    genome = os.path.join(job.assembly_dir, "genomes", f"{sample}.fasta")
     if os.path.exists(genome):
+        emit('assembly', 'skipped', sample=sample, metrics={'reused': True})
         return
+    emit('assembly', sample=sample, metrics={'threads': job.cpus})
     try:
-        process_data.assemble(sample=sample, reads=[fastq], assembly_dir=assembly_dir, assembler=assembler, sequencer="nanopore", cpus=cpus_per_sample, logfile=log, gsize=genome_size, single=False) # type: ignore
+        if job.assembler == "flye" and job.genome_size_bp is None:
+            adaptive_flye(
+                reads=job.fastq, output=genome,
+                audit_dir=os.path.join(os.path.dirname(job.assembly_dir), "qc_out", sample, "adaptive_assembly"),
+                cpus=job.cpus, min_quality=job.min_quality, min_length=job.min_length,
+                report=lambda message: logger(job.logfile, f"{sample}: {message}"),
+            )
+            return
+        process_data.assemble(
+            sample=sample,
+            reads=[job.fastq],
+            assembly_dir=job.assembly_dir,
+            assembler=job.assembler,
+            sequencer="nanopore",
+            cpus=job.cpus,
+            logfile=job.logfile,
+            gsize=job.genome_size_bp,
+            single=False,
+        )
     except Exception as exc:
-        logger(log, f"Unexpected assembly worker failure for {sample}: {exc}")
+        logger(job.logfile, f"Unexpected assembly worker failure for {sample}: {exc}")
+        failure_dir = os.path.join(os.path.dirname(job.assembly_dir), "qc_out", sample)
+        os.makedirs(failure_dir, exist_ok=True)
+        with open(os.path.join(failure_dir, "assembly_failure.txt"), "w") as handle:
+            handle.write(str(exc) + "\n")
     return
 
 # Run the pipeline
 tech_name = args.name
 run_name = args.run_name
 source = args.source
-source = os.path.join(source, run_name)
+source = os.path.join(source, args.input_run_name or run_name)
 mincov = args.mincov
 minqual = args.minqual
 if args.outdir:
     outDir = os.path.join(args.outdir, run_name)
 else:
     outDir = os.path.join(os.getcwd(), run_name)
+
+
+def identify_sample_with_ani(sample, expected_organism, genome, reads, threads):
+    """Run the opt-in ANI workflow with candidate-only Kraken evidence."""
+    result = identify_assembly(
+        sample_id=sample,
+        assembly=genome,
+        database_root=args.species_database_root,
+        output_directory=os.path.join(outDir, "species_identification", sample),
+        expected_organism=expected_organism,
+        reads=reads,
+        platform="Nanopore",
+        kraken_database=(
+            None
+            if identification_database_kind(args.species_database_root)
+            == "speciesfinder_kma"
+            else os.path.join(args.species_database_root, "kraken2")
+        ),
+        threads=max(1, int(threads)),
+        allow_candidate_database=args.allow_candidate_species_database,
+        require_mixed_signal_assessment=True,
+    )
+    return legacy_summary_fields(result)
 
 if args.update_existing:
     try:
@@ -201,6 +313,11 @@ if args.update_existing:
             outdir_parent=os.path.dirname(os.path.abspath(outDir)),
             run_name=run_name,
             sample_names=args.only_sample,
+            species_database_root=args.species_database_root,
+            species_platform="Nanopore",
+            species_gtdb_metadata=args.species_gtdb_metadata,
+            species_gtdbtk_conda_env=args.species_gtdbtk_conda_env,
+            species_placement_threads=max(1, int(args.cpus_per_sample or args.threads or 1)),
         )
     except (OSError, RuntimeError, ValueError) as exc:
         sys.stderr.write(f"BactiPipe sample update failed: {exc}\n")
@@ -235,10 +352,7 @@ except Exception as e:
     ip_address = "Unable to resolve hostname"
 
 # Manage computational resources
-if args.threads:
-    cpus = int(args.threads)
-else:
-    cpus = int(os.cpu_count() or 1)
+cpus = cpu_budget(args.threads)
 
 
 opt_cpus = max(1, cpus // 8)  # type: ignore # Optimal number of CPUs per sample
@@ -265,7 +379,7 @@ else:
     pool_size = int(defaut_max_samps)
 
 if args.cpus_per_sample:
-    cpus_per_sample = int(args.cpus_per_sample)
+    cpus_per_sample = min(cpus, max(1, int(args.cpus_per_sample)))
 else:
     cpus_per_sample = max(1, cpus // pool_size) # type: ignore
 
@@ -367,29 +481,18 @@ if args.only_sample:
         sys.exit(1)
     sample_info = selected_lines
 
-# Load pathogenPlease coic bacteria information
-bacteria = {}
-org_list = resource_files('bactipipe.data').joinpath('pathogenic_bacteria.txt')
-
-with open(org_list, 'r') as orgL:
-    for line in orgL:
-        parts = line.strip().split('\t')
-        if len(parts) >= 2:
-            name, size = parts[-1], parts[1]
-            bacteria[name] = int(size)
-
-def _genome_size_for(organism):
-    if organism == "Lambda":
-        return 48502
-    return int(bacteria.get(organism, 5e6))
+# Resolve the controlled organism and its size exactly once per sample.  The
+# same immutable resolution is used by QC, assembly, and final reporting.
+genome_size_catalog = GenomeSizeCatalog.from_package()
 
 # Validate the sample sheet
 bad_organisms = []
 bad_samples = []
 bad_barcodes = []
-sample_genome_sizes = {}
+sample_resolutions = {}
 sample_failures = {}
 expected_organisms = {}
+source_entries = set(os.listdir(source))
 
 
 # with open(sample_list, 'r') as sampL:
@@ -397,14 +500,21 @@ for line in sample_info:
     if not line.strip() or line.startswith("#"):
         continue
     sample, organism, barcode = line.strip().split('\t')
+    if sample.strip().casefold() in {"sample", "sample_id"}:
+        continue
     expected_organisms[sample] = organism
-    sample_genome_sizes[sample] = _genome_size_for(organism)
-    if organism.strip() not in bacteria and organism.lower() not in [ "lambda", "organism", "unknown"]:
-        logger(log, f"WARNING: Organism [{organism.strip()}] for sample {sample} is not a valid organism name")
-        time_print(f"WARNING: Organism [{organism.strip()}] for sample {sample} is not a valid organism name")
+    resolution = genome_size_catalog.resolve(organism)
+    sample_resolutions[sample] = resolution
+    if resolution.status in {"unsupported", "missing"}:
+        reason = (
+            f"Organism [{organism.strip()}] is not in the controlled BactiPipe "
+            "organism list or was left blank. Continuing in Unknown mode."
+        )
+        logger(log, f"WARNING: Sample {sample}: {reason}")
+        time_print(f"WARNING: Sample {sample}: {reason}", "Fail")
         bad_organisms.append(f"{sample}:{organism}")
     
-    if not sample in os.listdir(source) and barcode.replace("NB", "barcode") not in os.listdir(source):
+    if sample not in source_entries and barcode.replace("NB", "barcode") not in source_entries:
         logger(log, f"WARNING: Sample {sample} does not have corresponding fastq files.")
         time_print(f"WARNING: Sample {sample} does not have corresponding fastq files.", "Fail")
         bad_samples.append(sample)
@@ -446,8 +556,8 @@ if bad_barcodes:
         )
 
 if bad_organisms:
-    time_print("WARNING: Invalid organism names may cause QC failures.", "Fail")
-    logger(log, "WARNING: Invalid organism names may cause QC failures.")
+    time_print("Unsupported or blank organisms will use Unknown mode.")
+    logger(log, "Unsupported or blank organisms will use Unknown mode.")
 
 if bad_samples:
     b_s = ", ".join(bad_samples)
@@ -459,7 +569,7 @@ for line in sample_info:
     if not line.strip() or line.startswith("#"):
         continue
     sample = line.strip().split('\t')[0]
-    if sample not in bad_samples:
+    if sample.strip().casefold() not in {"sample", "sample_id"} and sample not in bad_samples:
         sample_lines.append(line.strip())
 
 sample_number = len(sample_lines)
@@ -469,10 +579,51 @@ if sample_number == 0:
     logger(log, "No valid samples to process. Exiting pipeline.")
     sys.exit(1)
 
-if pool_size > sample_number:
-    pool_size = sample_number
-    # Recalculate CPUs per sample
-    cpus_per_sample = max(1, cpus // pool_size)
+pool_size = bounded_worker_count(
+    sample_count=sample_number,
+    total_cpus=cpus,
+    cpus_per_sample=cpus_per_sample,
+    memory_worker_limit=allowed_samps,
+)
+
+write_execution_plan(
+    os.path.join(outDir, "sample_execution_plan.tsv"),
+    [
+        (sample, expected_organisms[sample], sample_resolutions[sample])
+        for sample in expected_organisms
+    ],
+    platform="Nanopore",
+    min_quality=minqual,
+    min_read_length=args.min_read_length,
+    min_coverage=mincov,
+    desired_coverage=300,
+    catalog_checksum=genome_size_catalog.checksum,
+)
+
+qc_jobs = []
+for line in sample_lines:
+    sample, organism, barcode = line.split("\t")
+    normalized_barcode = barcode.replace("NB", "barcode")
+    resolution = sample_resolutions[sample]
+    qc_jobs.append(
+        NanoporeQCJob(
+            sample=sample,
+            organism_entered=organism,
+            organism_canonical=resolution.canonical_name or "Unknown",
+            barcode=normalized_barcode,
+            raw_folder=os.path.join(source, normalized_barcode),
+            output_dir=os.path.join(qc_out, sample),
+            output_fastq=f"{sample}.fastq",
+            genome_size_bp=resolution.genome_size_bp,
+            min_avg_quality=minqual,
+            min_read_length=args.min_read_length,
+            min_coverage=mincov,
+            desired_coverage=300,
+            cpus=cpus_per_sample,
+            use_s3=args.use_s3,
+            bucket=args.bucket if args.use_s3 else None,
+        )
+    )
 
 # Compute pool size (number of parallel samples)
 print(f"\nRunig QC on samples in run {run_name}.\n")
@@ -491,6 +642,8 @@ time_print("PIPELINE STARTED", "Header")
 
 
 qc_start_msg = "Performing Quality Control"
+emit('inputs', 'completed')
+emit('read_qc', total=len(qc_jobs))
 time_print(qc_start_msg, "Header")
 logger(log, qc_start_msg, "Header")
 
@@ -503,7 +656,7 @@ logger(log, f"Total number of samples to be processed: {sample_number}\n")
 q_bar_fmt = '{l_bar} {bar:40} {n_fmt}/{total_fmt} [{elapsed}{postfix}]'
 process_map(
     process_sample,
-    sample_lines,
+    qc_jobs,
     max_workers=pool_size,
     bar_format=q_bar_fmt,
     chunksize=1,
@@ -535,6 +688,7 @@ passed_samples = [
 ]
 
 passed_number = len(passed_samples)
+emit('read_qc', 'completed', total=len(qc_jobs), finished=len(qc_jobs), failed=len(qc_jobs) - passed_number)
 print()
 
 if len(passed_samples) == 0:
@@ -555,19 +709,20 @@ if failed_samples:
 # Assemble genomes for samples that passed QC
 assembly_start_msg = "Genome Assembly for samples that passed QC" 
 time_print(assembly_start_msg, "Header")
+emit('assembly', total=passed_number)
 logger(log, assembly_start_msg, "Header")
 
 fastq_files = []
 for sample in sorted(os.listdir(qc_out)):
     sample_dir = os.path.join(qc_out, sample)
-    if not os.path.isdir(sample_dir):
+    if not os.path.isdir(sample_dir) or sample not in passed_samples:
         continue
     p_fastq = os.path.join(qc_out, sample, f"{sample}.fastq")
     p_gz = os.path.join(qc_out, sample, f"{sample}.fastq.gz")
     if os.path.exists(p_fastq):
-        fastq_files.append([sample, p_fastq, sample_genome_sizes.get(sample, 5e6)])
+        fastq_files.append((sample, p_fastq))
     elif os.path.exists(p_gz):
-        fastq_files.append([sample, p_gz, sample_genome_sizes.get(sample, 5e6)])
+        fastq_files.append((sample, p_gz))
 
 pass_msg = f"Available for assembly: {len(fastq_files)} of {sample_number} samples."
 time_print(pass_msg, "Pass")
@@ -619,12 +774,33 @@ if not assembly_input:
         sys.exit(1)
 
 if assembly_input:
-    if num_to_assemble < pool_size:
-        cpus_per_sample = max(1, cpus // num_to_assemble)
-    
-    if assembler == "unicycler":
-        cpus_per_sample = max(cpus_per_sample, 10)
-        pool_size = max(1, cpus // cpus_per_sample)
+    if assembler == 'flye':
+        assembly_resources = plan_flye_resources(num_to_assemble, cpus,
+            requested_threads=args.cpus_per_sample, memory_gb=available_memory_gb())
+        assembly_pool_size = assembly_resources.jobs
+        assembly_cpus = assembly_resources.threads_per_sample
+        atomic_json(Path(outDir) / 'nanopore_assembly_resources.json', asdict(assembly_resources))
+    else:
+        assembly_cpus = cpus_per_sample if args.cpus_per_sample else max(1, cpus // num_to_assemble)
+        if assembler == 'unicycler':
+            assembly_cpus = min(cpus, max(assembly_cpus, 10))
+        assembly_pool_size = bounded_worker_count(sample_count=num_to_assemble, total_cpus=cpus,
+            cpus_per_sample=assembly_cpus, memory_worker_limit=allowed_samps)
+    assembly_dir = os.path.join(outDir, "assemblies")
+    assembly_jobs = [
+        NanoporeAssemblyJob(
+            sample=sample,
+            fastq=fastq,
+            genome_size_bp=sample_resolutions[sample].genome_size_bp,
+            assembly_dir=assembly_dir,
+            assembler=assembler,
+            cpus=assembly_cpus,
+            logfile=log,
+            min_quality=minqual,
+            min_length=args.min_read_length,
+        )
+        for sample, fastq in assembly_input
+    ]
 
     stdout = subprocess.run([assembler, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out = (stdout.stdout or stdout.stderr).decode('utf-8', errors='replace')
@@ -637,20 +813,22 @@ if assembly_input:
     simple_print(f"  ---> {assembler_message}")
     logger(log, f"  ---> {assembler_message}")
 
-    simple_print(f"  ---> {cpus_per_sample} CPUs will be used per sample.")
-    logger(log, f"  ---> {cpus_per_sample} CPUs will be used per sample.")
+    simple_print(f"  ---> {assembly_cpus} CPUs will be used per sample.")
+    logger(log, f"  ---> {assembly_cpus} CPUs will be used per sample.")
+    allocation = (f"Assembly allocation: {assembly_pool_size} concurrent samples x {assembly_cpus} threads "
+                  f"= {assembly_pool_size * assembly_cpus}/{cpus} allocated CPUs; {num_to_assemble} samples total.")
+    emit('assembly', total=num_to_assemble, metrics={'concurrent_samples': assembly_pool_size,
+         'threads_per_sample': assembly_cpus, 'allocated_cpus': cpus})
+    time_print(allocation)
+    logger(log, allocation)
+    sys.stdout.flush()
 
-    a_bar_fmt = '{l_bar} {bar:40} {n_fmt}/{total_fmt} [{elapsed}{postfix}]'
-    process_map(
-        assemble_sample,
-        assembly_input,
-        max_workers=pool_size,
-        bar_format=a_bar_fmt,
-        chunksize=1,
-        desc="---> Assembling genomes: ",
-        colour="green",
-        disable=False,
-    )
+    def report_assembly_progress(message):
+        time_print(message)
+        logger(log, message)
+        sys.stdout.flush()
+    run_assembly_jobs(assembly_jobs, workers=assembly_pool_size, worker=assemble_sample,
+        report=report_assembly_progress, state_path=Path(outDir) / 'nanopore_assembly_progress.json')
 
 # Count the number of samples that have been assembled
 assembled_samples = [f for f in os.listdir(genomes_dir) if f.endswith(".fasta") and os.path.getsize(os.path.join(genomes_dir, f)) > 0]
@@ -659,6 +837,8 @@ assembled_number = len(assembled_samples)
 assembly_msg = f"Genome assembly completed for {assembled_number} of {passed_number} samples.\n"
 print()
 time_print(assembly_msg, "Pass")
+emit('assembly', 'completed', finished=passed_number,
+     failed=sum(not os.path.isfile(os.path.join(genomes_dir, sample + '.fasta')) for sample in passed_samples))
 logger(log, assembly_msg)
 
 # Print samples that failed assembly
@@ -668,11 +848,16 @@ if failed_assembly:
     time_print(failed_assembly_msg, "Fail")
     logger(log, failed_assembly_msg, "Fail")
     for sample in failed_assembly:
+        failure_path = os.path.join(outDir, "qc_out", sample, "assembly_failure.txt")
+        assembly_reason = "Genome assembly did not produce a usable FASTA file."
+        if os.path.isfile(failure_path):
+            with open(failure_path) as handle:
+                assembly_reason = handle.read().strip() or assembly_reason
         sample_failure_audit.record_failure(
             sample_failures,
             sample,
             "assembly",
-            "Genome assembly did not produce a usable FASTA file.",
+            assembly_reason,
         )
 
 if len(failed_assembly) == passed_number:
@@ -682,6 +867,7 @@ if len(failed_assembly) == passed_number:
 
 kmer_message = "Verifying Taxonomic Identity"
 time_print(kmer_message, "Header")
+emit('identification', total=sum(sample not in bad_samples for sample in expected_organisms))
 logger(log, kmer_message, "Header")
 
 # Find the organism for each sample
@@ -695,13 +881,19 @@ with(open(temp_qc_summary , 'w')) as qc_sum:
         if line.startswith("#"):
             continue
         sample, organism, barcode = line.strip().split('\t')
+        if sample.strip().casefold() in {"sample", "sample_id"}:
+            continue
+        if sample in bad_samples:
+            continue
 
-        if organism not in bacteria:
+        emit('identification', sample=sample)
+        resolution = sample_resolutions[sample]
+        if not resolution.is_known:
             sys_organism = "unknown"
             genome_size = None
         else:
-            sys_organism = organism
-            genome_size = 48502 if organism == "Lambda" else bacteria.get(organism, None)  
+            sys_organism = resolution.canonical_name
+            genome_size = resolution.genome_size_bp
 
         genome = os.path.join(outDir, "assemblies", "genomes", f"{sample}.fasta")
         if not os.path.exists(genome) or os.path.getsize(genome) == 0:
@@ -763,78 +955,104 @@ with(open(temp_qc_summary , 'w')) as qc_sum:
         else:
             qc_verdict = "Pass"
 
-        if genome_size:
-            coverage = total_bases/genome_size
-            cov_display = f"{coverage:.2f}X"
-            if coverage >= mincov:
-                cov_verdict = "Pass"
-            else:
-                cov_verdict = "Fail"
-        else:
-            coverage = "N/A"
-            cov_verdict = "N/A"
-            cov_display = "N/A"
+        coverage, cov_verdict = assembly_depth(
+            total_bases, genome, mincov,
+            audit_path=os.path.join(qc_out, sample, "depth_metrics.json"),
+        )
+        cov_display = f"{coverage:.2f}X" if coverage is not None else "N/A"
 
-        # Find organism
-        try:
-            kmer_result = find_organism.find_species_with_kmrf(s_name=sample, lab_species=sys_organism, genome=genome, dataOut=outDir, org_type="bacteria", logfile=log)
-            if not kmer_result:
+        if is_lambda_control(organism):
+            control_evidence = assess_control(genome, os.path.join(qc_out, sample, "lambda_control"),
+                min_identity=args.lambda_min_identity, min_coverage=args.lambda_min_coverage,
+                report=lambda message: logger(log, message))
+            writer.writerow(control_summary_row(sample, avqc, qc_verdict, organism, cov_display, mincov, cov_verdict, control_evidence))
+            if control_evidence["status"] == "Error":
+                sample_failure_audit.record_failure(sample_failures, sample, "control_confirmation", control_evidence["reason"])
+            reported_samples.add(sample)
+            continue
+
+        if species_identification_enabled:
+            filtered_reads = [
+                path
+                for path in (
+                    os.path.join(qc_out, sample, f"{sample}.fastq"),
+                    os.path.join(qc_out, sample, f"{sample}.fastq.gz"),
+                )
+                if os.path.isfile(path)
+            ][:1]
+            try:
+                summary_fields = identify_sample_with_ani(
+                    sample, sys_organism, genome, filtered_reads, cpus_per_sample
+                )
+            except Exception as e:
+                time_print(f"Error at species identification step: {e}", "Fail")
+                logger(log, f"Error at species identification step: {e}")
                 sample_failure_audit.record_failure(
                     sample_failures,
                     sample,
                     "organism_identification",
-                    "Organism identification did not return a result.",
+                    f"Species identification failed: {e}",
                 )
                 continue
-            hit, tax_confirm, possibilities = kmer_result
-        except Exception as e:
-            time_print(f"Error at find organism step: {e}", "Fail")
-            logger(log, f"Error at find organism step: {e}")
-            sample_failure_audit.record_failure(
-                sample_failures,
-                sample,
-                "organism_identification",
-                f"Organism identification failed: {e}",
-            )
-            continue
+            best_org = summary_fields.identified_organism
+            best_percent = summary_fields.match_percent
+            tax_confirm = summary_fields.taxonomic_confirmation
+            identified_org = summary_fields.coverage_organism
+            best_other_org = None
+        else:
+            try:
+                kmer_result = find_organism.find_species_with_kmrf(s_name=sample, lab_species=sys_organism, genome=genome, dataOut=outDir, org_type="bacteria", logfile=log)
+                if not kmer_result:
+                    sample_failure_audit.record_failure(
+                        sample_failures,
+                        sample,
+                        "organism_identification",
+                        "Organism identification did not return a result.",
+                    )
+                    continue
+                hit, tax_confirm, possibilities = kmer_result
+            except Exception as e:
+                time_print(f"Error at find organism step: {e}", "Fail")
+                logger(log, f"Error at find organism step: {e}")
+                sample_failure_audit.record_failure(
+                    sample_failures,
+                    sample,
+                    "organism_identification",
+                    f"Organism identification failed: {e}",
+                )
+                continue
 
-        best_org = None
-        best_percent = None
-        best_other_org = None
-        identified_org = None
-        try:
-            if tax_confirm == "Pass" or tax_confirm == "N/A":
-                best_org = hit.split(" (")[0]
-                best_percent = hit.split(" (")[1].strip(")")
-            else:
-                best_other_hit = hit.split(" --- ")[0].split(": ")[1]
-                best_other_org = best_other_hit.split(" (")[0]
-                best_other_percent = best_other_hit.split(" (")[1].strip(")")
-        except (AttributeError, IndexError, TypeError, ValueError) as e:
-            sample_failure_audit.record_failure(
-                sample_failures,
-                sample,
-                "organism_identification",
-                f"Organism-identification output could not be parsed: {e}",
-            )
-            continue
+            best_org = None
+            best_percent = None
+            best_other_org = None
+            identified_org = None
+            try:
+                if tax_confirm == "Pass" or tax_confirm == "N/A":
+                    best_org = hit.split(" (")[0]
+                    best_percent = hit.split(" (")[1].strip(")")
+                    identified_org = best_org
+                else:
+                    best_other_hit = hit.split(" --- ")[0].split(": ")[1]
+                    best_other_org = best_other_hit.split(" (")[0]
+                    best_other_percent = best_other_hit.split(" (")[1].strip(")")
+                    identified_org = best_other_org
+            except (AttributeError, IndexError, TypeError, ValueError) as e:
+                sample_failure_audit.record_failure(
+                    sample_failures,
+                    sample,
+                    "organism_identification",
+                    f"Organism-identification output could not be parsed: {e}",
+                )
+                continue
 
-        # Update coverage for samples with pre-unknown organisms
-        if coverage == "N/A":# and organism != "unknown":
-            if best_org:
-                identified_org = best_org
-            elif best_other_org:
-                identified_org = best_other_org
-            if identified_org in bacteria:
-                g_size = bacteria.get(identified_org, None)
-                coverage = total_bases / int(g_size)
-                cov_display = f"{coverage:.2f}X"
+        logger(log, f"Sample {sample}: assembly-based depth {cov_display}; {cov_verdict}")
 
-        if best_org:
+        if species_identification_enabled or best_org:
             writer.writerow([sample, f'{avqc:.2f}', qc_verdict, organism, best_org, best_percent, cov_display, mincov, cov_verdict, tax_confirm])
         else:
             writer.writerow([sample, f'{avqc:.2f}', qc_verdict, organism, f'Closest: {best_other_org}', best_other_percent, cov_display, mincov, cov_verdict, tax_confirm])
         reported_samples.add(sample)
+        emit('identification', 'completed', sample=sample)
 
 sample_failure_audit.publish_failures(
     outDir,
@@ -849,28 +1067,89 @@ if not reported_samples:
     sys.exit(1)
 
 # Assess Genome Quality with CheckM
+for progress_sample in expected_organisms:
+    if progress_sample not in bad_samples and progress_sample not in reported_samples:
+        emit('identification', 'failed' if sample_failures.get(progress_sample, ('', ''))[0] == 'organism_identification' else 'skipped', sample=progress_sample)
+emit('identification', 'completed')
+emit('assembly_qc')
 genomes_dir = os.path.join(outDir, "assemblies", "genomes")
 checkm_dir = os.path.join(outDir, "checkM")
-checkm_out, checkm_ver = process_data.checkM_stats(genomes_dir=genomes_dir, cpus=cpus, outdir=checkm_dir, logfile=log)
+checkm_out, checkm_ver = process_data.checkM_stats(
+    genomes_dir=genomes_dir, cpus=cpus, outdir=checkm_dir, logfile=log,
+    exclude_samples=[sample for sample, organism in expected_organisms.items() if is_lambda_control(organism)],
+)
+
+if species_identification_enabled:
+    try:
+        reconciled_species = reconcile_batch_identifications(
+            species_output_root=os.path.join(outDir, "species_identification"),
+            database_root=args.species_database_root,
+            expected_organisms=expected_organisms,
+            platform="Nanopore",
+            assemblies={
+                sample_id: os.path.join(
+                    outDir, "assemblies", "genomes", f"{sample_id}.fasta"
+                )
+                for sample_id in expected_organisms
+            },
+            gtdb_metadata_tsv=args.species_gtdb_metadata,
+            gtdbtk_command_prefix=(
+                "conda", "run", "-n", args.species_gtdbtk_conda_env, "gtdbtk"
+            ),
+            placement_threads=max(1, int(cpus_per_sample)),
+            checkm_contamination_by_sample={
+                sample_id: values[1] for sample_id, values in checkm_out.items()
+            },
+            maximum_checkm_contamination=args.max_contamination,
+        )
+        update_summary_identifications(temp_qc_summary, reconciled_species)
+    except Exception as e:
+        time_print(f"Run-wide species-signal review failed: {e}", "Fail")
+        logger(log, f"Run-wide species-signal review failed: {e}")
+        sys.exit(1)
 
 # Final summary
 qc_summary = os.path.join(outDir, f"{run_name}_qc_summary.tsv")
 time_print('Final summary', "Header")
+emit('assembly_qc', 'completed')
 logger(log, 'Final summary', "Header")
 
-tools = OrderedDict([
+tool_entries = [
     ("BactiPipe", bactipipe_version),
     ("BactiPipe database", database_identity_label()),
     ("Filtlong", nano_qc.filtlong_version()),
     (args.assembler, assembly_version),
-    ("KmerFinder", find_organism.kmerfinder_version),
-    ("CheckM", checkm_ver)
-])
+]
+if not species_identification_enabled:
+    tool_entries.append(("KmerFinder", find_organism.kmerfinder_version))
+tool_entries.append(("CheckM", checkm_ver))
+tools = OrderedDict(tool_entries)
+if any(is_lambda_control(organism) for organism in expected_organisms.values()):
+    tools["BLASTn"] = command_version(("blastn", "-version"))
+    tools["Minimum Lambda identity"] = f"{args.lambda_min_identity:g}%"
+    tools["Minimum Lambda genome coverage"] = f"{args.lambda_min_coverage:g}%"
+if species_identification_enabled:
+    tools["Species identification database"] = identification_database_version(
+        args.species_database_root
+    )
+    tools["skani"] = command_version(("skani",))
+    if identification_database_kind(args.species_database_root) == "speciesfinder_kma":
+        tools["SpeciesFinder db"] = os.path.basename(database_identity(args.species_database_root).get("database_prefix", "Not recorded"))
+        tools["SpeciesFinder"] = python_package_version("SpeciesFinder")
+        tools["KMA"] = command_version(("kma",))
+    else:
+        tools["Kraken2"] = command_version(("kraken2",))
+    if args.species_gtdb_metadata:
+        tools["GTDB-Tk"] = command_version(
+            ("conda", "run", "-n", args.species_gtdbtk_conda_env, "gtdbtk")
+        )
 
 tool_lines = ["\n"] # Blank line before tools section
+logger(log, database_log_record(args.species_database_root))
 for tool, version in tools.items():
     tool_lines.append(f"{tool}>>{version}")
 tool_lines.extend([
+    f"Minimum depth>>{mincov:g}X",
     f"Required Mean quality>>{args.minqual}",
     f"Minimum read length>>{args.min_read_length} bp",
     f"Completeness cutoff>>{args.min_completeness:g}%",
@@ -891,6 +1170,7 @@ process_data.make_summary(
     logfile=log,
     min_completeness=args.min_completeness,
     max_contamination=args.max_contamination,
+    defer_pdf=args.defer_qc_pdf,
 )
 
 # Delete fastq samples from the QC step

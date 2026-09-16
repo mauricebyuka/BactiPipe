@@ -1,0 +1,6 @@
+name: bactipipe-kma
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::kma=1.6.13

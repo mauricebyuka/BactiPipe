@@ -1,0 +1,2 @@
+reference	length_bp	sequence_sha256	ncbi_comparison_accession	ncbi_sequence_sha256	differences_1based_bundled_ncbi	verified_on	source_url
+bundled:Lambda	48502	135c9042edbda8729c0bb550e2747fe968383904344123fad3e71a17b8559383	NC_001416.1	36432a40f602258d19ae7c8152ddbc30390b559f2859c01d7047c77b048c71b3	37589:T:C;37742:T:C;43082:A:G;45352:A:G	2026-09-12	https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NC_001416.1&rettype=fasta&retmode=text

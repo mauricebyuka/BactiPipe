@@ -1,0 +1,6 @@
+group_id	display_name	species_taxid	species_name	rationale
+escherichia_coli_shigella	Escherichia coli/Shigella complex	562	Escherichia coli	Whole-genome ANI and routine short- or long-read mapping do not reliably separate E. coli from traditional Shigella species.
+escherichia_coli_shigella	Escherichia coli/Shigella complex	621	Shigella boydii	Whole-genome ANI and routine short- or long-read mapping do not reliably separate E. coli from traditional Shigella species.
+escherichia_coli_shigella	Escherichia coli/Shigella complex	622	Shigella dysenteriae	Whole-genome ANI and routine short- or long-read mapping do not reliably separate E. coli from traditional Shigella species.
+escherichia_coli_shigella	Escherichia coli/Shigella complex	623	Shigella flexneri	Whole-genome ANI and routine short- or long-read mapping do not reliably separate E. coli from traditional Shigella species.
+escherichia_coli_shigella	Escherichia coli/Shigella complex	624	Shigella sonnei	Whole-genome ANI and routine short- or long-read mapping do not reliably separate E. coli from traditional Shigella species.

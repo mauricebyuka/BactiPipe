@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,7 +37,23 @@ class SampleUpdateTests(unittest.TestCase):
             summary = (target / f"{run_name}_qc_summary.tsv").read_text()
             self.assertIn("S1\told-one", summary)
             self.assertIn("S2\tnew-two", summary)
-            self.assertIn('"S2"', (target / "sample_update_history.jsonl").read_text())
+            temporary_summary = (target / "qc_out" / "temp_qc_summary.tsv").read_text()
+            self.assertIn("S1\told-one", temporary_summary)
+            self.assertIn("S2\tnew-two", temporary_summary)
+            history = json.loads(
+                (target / "sample_update_history.jsonl").read_text().splitlines()[-1]
+            )
+            self.assertEqual(history["samples"], ["S2"])
+            audit = target / history["provenance"]
+            self.assertIn(
+                "S1\told-one", (audit / f"{run_name}_qc_summary.tsv").read_text()
+            )
+            self.assertNotIn(
+                "S1\told-one",
+                (
+                    audit / "selected_reanalysis" / f"{run_name}_qc_summary.tsv"
+                ).read_text(),
+            )
 
     def test_failed_reanalysis_leaves_existing_result_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -72,6 +89,10 @@ class SampleUpdateTests(unittest.TestCase):
             genome.write_text(f">{sample}\nACGT\n")
         (root / f"{run_name}_qc_summary.tsv").write_text(
             "BactiPipe>>v0.1.0\nSample ID\tMean Quality\n"
+            + "".join(f"{sample}\t{value}\n" for sample, value in samples.items())
+        )
+        (root / "qc_out" / "temp_qc_summary.tsv").write_text(
+            "Sample\tMean Quality\n"
             + "".join(f"{sample}\t{value}\n" for sample, value in samples.items())
         )
         (root / "sample_failures.tsv").write_text("sample_id\tstage\treason\n")

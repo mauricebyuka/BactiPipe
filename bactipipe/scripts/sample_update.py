@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 
 def run_qc_sample_update(
@@ -21,6 +22,11 @@ def run_qc_sample_update(
     outdir_parent: str | Path,
     run_name: str,
     sample_names: list[str],
+    species_database_root: Optional[str] = None,
+    species_platform: str = "",
+    species_gtdb_metadata: Optional[str] = None,
+    species_gtdbtk_conda_env: str = "gtdbtk",
+    species_placement_threads: int = 1,
 ) -> None:
     """Run selected samples separately, merge their outputs, and publish atomically."""
 
@@ -64,7 +70,71 @@ def run_qc_sample_update(
         for sample_name in selected:
             _replace_sample_outputs(fresh, merged, sample_name)
         _merge_qc_summary(target, fresh, merged, run_name, selected)
+        _merge_temporary_summary(target, fresh, merged, selected)
         _merge_failure_audit(target, fresh, merged, selected)
+        if species_database_root:
+            from bactipipe.batch_species import (
+                checkm_contamination_from_summary,
+                expected_organisms_from_summary,
+                reconcile_batch_identifications,
+                update_final_summary_verdicts,
+                update_summary_identifications,
+            )
+
+            summary_path = merged / f"{run_name}_qc_summary.tsv"
+            temporary_summary_path = merged / "qc_out" / "temp_qc_summary.tsv"
+            expected_summary_path = (
+                temporary_summary_path
+                if temporary_summary_path.is_file()
+                else summary_path
+            )
+            expected_organisms = expected_organisms_from_summary(
+                expected_summary_path
+            )
+            reconciled = reconcile_batch_identifications(
+                species_output_root=merged / "species_identification",
+                database_root=species_database_root,
+                expected_organisms=expected_organisms,
+                platform=species_platform,
+                assemblies={
+                    sample_id: merged
+                    / "assemblies"
+                    / "genomes"
+                    / f"{sample_id}.fasta"
+                    for sample_id in expected_organisms
+                },
+                gtdb_metadata_tsv=species_gtdb_metadata,
+                gtdbtk_command_prefix=(
+                    "conda",
+                    "run",
+                    "-n",
+                    species_gtdbtk_conda_env,
+                    "gtdbtk",
+                ),
+                placement_threads=max(1, int(species_placement_threads)),
+                checkm_contamination_by_sample=checkm_contamination_from_summary(
+                    summary_path
+                ),
+                maximum_checkm_contamination=_argument_float(
+                    argv, "--max_contamination", 10.0
+                ),
+            )
+            if temporary_summary_path.is_file():
+                update_summary_identifications(temporary_summary_path, reconciled)
+            update_summary_identifications(summary_path, reconciled)
+            if temporary_summary_path.is_file():
+                update_final_summary_verdicts(
+                    summary_path,
+                    temporary_summary_path,
+                    minimum_completeness=_argument_float(
+                        argv, "--min_completeness", 90.0
+                    ),
+                    maximum_contamination=_argument_float(
+                        argv, "--max_contamination", 10.0
+                    ),
+                )
+        if "--defer-qc-pdf" in argv:
+            (merged / f"{run_name}_qc_summary.pdf").unlink(missing_ok=True)
         _record_update(merged, fresh, run_name, selected)
         _publish_directory(merged, target)
     finally:
@@ -104,9 +174,13 @@ def _replace_sample_outputs(fresh: Path, merged: Path, sample_name: str) -> None
     relatives = (
         Path("qc_out") / sample_name,
         Path("qc_out") / f"{sample_name}_metrics.txt",
+        Path("qc_out") / f"{sample_name}_metrics.png",
+        Path("qc_out") / f"{sample_name}_quality_distribution.png",
         Path("assemblies") / sample_name,
         Path("assemblies") / "genomes" / f"{sample_name}.fasta",
+        Path("assemblies") / "genomes" / f"{sample_name}.input.json",
         Path("checkM") / "bins" / f"{sample_name}.fasta",
+        Path("species_identification") / sample_name,
     )
     for relative in relatives:
         source = fresh / relative
@@ -150,6 +224,36 @@ def _merge_qc_summary(
         csv.writer(handle, delimiter="\t", lineterminator="\n").writerows(output_rows)
 
 
+def _merge_temporary_summary(
+    existing: Path,
+    fresh: Path,
+    merged: Path,
+    sample_names: tuple[str, ...],
+) -> None:
+    relative = Path("qc_out") / "temp_qc_summary.tsv"
+    old_path = existing / relative
+    new_path = fresh / relative
+    if not old_path.is_file() or not new_path.is_file():
+        return
+    old_prefix, old_rows = _split_temporary_summary(old_path.read_text())
+    new_prefix, new_rows = _split_temporary_summary(new_path.read_text())
+    selected = set(sample_names)
+    replacements = {row[0]: row for row in new_rows if row and row[0] in selected}
+    if set(replacements) != selected:
+        missing = sorted(selected - set(replacements))
+        raise ValueError(
+            "Reanalysis temporary summary is missing sample(s): " + ", ".join(missing)
+        )
+    output_rows = [replacements.get(row[0], row) if row else row for row in old_rows]
+    existing_names = {row[0] for row in old_rows if row}
+    output_rows.extend(replacements[name] for name in sample_names if name not in existing_names)
+    destination = merged / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        handle.write("\n".join(new_prefix or old_prefix) + "\n")
+        csv.writer(handle, delimiter="\t", lineterminator="\n").writerows(output_rows)
+
+
 def _merge_failure_audit(
     existing: Path,
     fresh: Path,
@@ -188,9 +292,25 @@ def _record_update(
     audit_dir = root / "sample_updates" / completed_at.strftime("%Y%m%dT%H%M%S%fZ")
     audit_dir.mkdir(parents=True, exist_ok=True)
     for name in (f"{run_name}_qc_summary.tsv", "sample_failures.tsv"):
-        source = fresh_root / name
+        source = root / name
         if source.is_file():
             shutil.copy2(source, audit_dir / name)
+    selected_audit = audit_dir / "selected_reanalysis"
+    selected_audit.mkdir()
+    for name in (f"{run_name}_qc_summary.tsv", "sample_failures.tsv"):
+        source = fresh_root / name
+        if source.is_file():
+            shutil.copy2(source, selected_audit / name)
+    for relative in (
+        Path("qc_out") / "temp_qc_summary.tsv",
+        Path("species_identification") / "cross_sample_signal_review.tsv",
+        Path("species_identification") / "cross_sample_signal_review.json",
+    ):
+        source = root / relative
+        if source.is_file():
+            destination = audit_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
     path = root / "sample_update_history.jsonl"
     with path.open("a", encoding="utf-8") as handle:
         handle.write(
@@ -228,6 +348,33 @@ def _split_summary(text: str) -> tuple[list[str], list[list[str]]]:
         raise ValueError("BactiPipe QC summary header was not found.")
     rows = list(csv.reader(lines[header_index + 1 :], delimiter="\t"))
     return lines[: header_index + 1], [row for row in rows if row]
+
+
+def _split_temporary_summary(text: str) -> tuple[list[str], list[list[str]]]:
+    lines = text.splitlines()
+    header_index = next(
+        (index for index, line in enumerate(lines) if line.startswith("Sample\t")),
+        None,
+    )
+    if header_index is None:
+        raise ValueError("BactiPipe temporary QC summary header was not found.")
+    rows = list(csv.reader(lines[header_index + 1 :], delimiter="\t"))
+    return lines[: header_index + 1], [row for row in rows if row]
+
+
+def _argument_float(argv: list[str], name: str, default: float) -> float:
+    for index, value in enumerate(argv):
+        if value == name and index + 1 < len(argv):
+            try:
+                return float(argv[index + 1])
+            except ValueError:
+                return default
+        if value.startswith(name + "="):
+            try:
+                return float(value.split("=", 1)[1])
+            except ValueError:
+                return default
+    return default
 
 
 def _read_dict_tsv(path: Path) -> list[dict[str, str]]:

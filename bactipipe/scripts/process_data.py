@@ -7,6 +7,7 @@ import shlex
 
 from bactipipe.scripts.pdf_renderer import render_pdf_from_tsv, LayoutConfig
 from reportlab.lib.units import inch
+from bactipipe.scripts.qc_plan import flye_size_arguments, overall_quality_verdict
 
 def trimmer(sample, raw_reads, newReadsFolder, cpus=24, logfile=None):
     # with open (self.log, 'a') as log:
@@ -65,7 +66,7 @@ def filter_genome(input_fasta, output_fasta, min_length=500):
     SeqIO.write(records, output_fasta, 'fasta')
     return output_fasta
 
-def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile=None, gsize='5m', single=True):
+def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile=None, gsize=None, single=True, memory_gb=None):
     log = os.path.join(assembly_dir, sample, sample + ".log")
     try:
         if single:
@@ -112,8 +113,7 @@ def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile
         # assembly_dir = os.path.join(outDir, 'assemblies')   
         tempDir = os.path.join(assembly_dir, sample)
         genomesDir = os.path.join(assembly_dir, 'genomes')
-        if not os.path.exists(genomesDir):
-            os.makedirs(genomesDir)
+        os.makedirs(genomesDir, exist_ok=True)
 
         finalAssembly = os.path.join(genomesDir, sample + '.fasta')
 
@@ -129,12 +129,16 @@ def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile
                     cmd1 = ["spades.py", "--isolate", "-1", read1, "-2", read2, "-o", tempDir, "--threads", str(cpus)]
                 elif len(reads) == 1:
                     cmd1 = ["spades.py", "--isolate", "-s", single_reads, "-o", tempDir, "--threads", str(cpus)]
+                if memory_gb is not None:
+                    cmd1 += ['--memory', str(int(memory_gb))]
                 draft_assembly = f'{tempDir}/scaffolds.fasta'
             elif assembler == "skesa":
                 if len(reads) == 2:
                     cmd1 = ["skesa", "--reads", f"{read1},{read2}", "--contigs_out", f"{tempDir}/assembly.fasta", "--cores", str(cpus)]
                 elif len(reads) == 1:
                     cmd1 = ["skesa", "--reads", single_reads, "--contigs_out", f"{tempDir}/assembly.fasta", "--cores", str(cpus)]
+                if memory_gb is not None:
+                    cmd1 += ['--memory', str(int(memory_gb))]
                 draft_assembly = f'{tempDir}/assembly.fasta'
             else:
                 return_info = f"Assembler {assembler} is not supported for Illumina reads. Please use Skesa, Spades or Unicycler."
@@ -148,7 +152,18 @@ def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile
                 cmd1 = ["unicycler", "-l", single_reads, "-o", tempDir, "--threads", str(cpus)]
                 draft_assembly = f'{tempDir}/assembly.fasta'
             elif assembler == "flye":
-                cmd1 = ["flye", "--nano-hq", single_reads, "--out-dir", tempDir, "--threads", str(cpus), "--asm-coverage", "50", "--g", str(gsize), "--iterations", "2"]
+                cmd1 = [
+                    "flye",
+                    "--nano-hq",
+                    single_reads,
+                    "--out-dir",
+                    tempDir,
+                    "--threads",
+                    str(cpus),
+                    *flye_size_arguments(gsize),
+                    "--iterations",
+                    "2",
+                ]
                 draft_assembly = f'{tempDir}/assembly.fasta'
             else:
                 return_info = f"Assembler {assembler} is not supported for Nanopore reads. Please use Unicycler or Flye."
@@ -164,7 +179,17 @@ def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile
             if single:
                 time_print(info2, s_type="command")
             logger(log, info2, s_type="command")
-            execute = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            # Sample QC workers deliberately cap numerical-library thread pools.
+            # Do not let their OMP_NUM_THREADS=1 override SPAdes --threads (or
+            # assemblers launched by Unicycler). Change only the child environment;
+            # concurrent workers and Python/BLAS retain their existing limits.
+            assembly_env = dict(os.environ, OMP_NUM_THREADS=str(max(1, int(cpus))))
+            logger(log, f'Assembler OpenMP thread budget: {assembly_env["OMP_NUM_THREADS"]}', mode='simple')
+            execute = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     env=assembly_env)
+
+            if execute.stdout:
+                logger(log, execute.stdout.decode('utf-8', errors='replace'), mode='simple')
 
             if execute.returncode != 0:
                 return_info = f"Assembly failed for {sample}: exit {execute.returncode}"
@@ -195,7 +220,8 @@ def assemble(sample, reads, assembly_dir, assembler, sequencer, cpus=24, logfile
         logger(log, f"Unexpected error in assemble for {sample}: {e}")
         return
                             
-def checkM_stats(genomes_dir, outdir, cpus=24, logfile=None):
+def checkM_stats(genomes_dir, outdir, cpus=24, logfile=None, exclude_samples=()):
+    genomes_dir, outdir = os.fspath(genomes_dir), os.fspath(outdir)
     log = logfile
     if not os.path.exists(outdir):
         os.makedirs(outdir)
@@ -215,6 +241,21 @@ def checkM_stats(genomes_dir, outdir, cpus=24, logfile=None):
                 version = line.split(":::")[1].strip().split()[-1]
                 break
             
+    if exclude_samples:
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        excluded = set(exclude_samples)
+        # Read-only links leave final assemblies available for reporting/retries.
+        with TemporaryDirectory(prefix="bactipipe-checkm-inputs-") as tmp:
+            eligible = [path for path in Path(genomes_dir).glob("*.fasta") if path.stem not in excluded]
+            logger(log, f"CheckM excludes Lambda controls: {', '.join(sorted(excluded))}")
+            if not eligible:
+                logger(log, "CheckM skipped: no bacterial assemblies to assess.")
+                return {}, version
+            for path in eligible:
+                (Path(tmp) / path.name).symlink_to(path.resolve())
+            return checkM_stats(tmp, outdir, cpus=cpus, logfile=log)
+
     checkm_intro = f'Assessing Genome Quality with CheckM (version: {version})'
     time_print(checkm_intro, "Header")
     logger(log, checkm_intro, "Header")
@@ -270,7 +311,9 @@ def make_summary(
     logfile=None,
     min_completeness=90,
     max_contamination=10,
+    defer_pdf=False,
 ):
+    from bactipipe.lambda_control import is_lambda_control, CONTROL_IDENTIFICATION
     log = logfile
     with(open(qc_summary , 'w')) as qc_sum, open(temp_qc_summary, 'r') as temp_sum:
         writer = csv.writer(qc_sum, dialect='excel-tab')
@@ -278,28 +321,48 @@ def make_summary(
             writer.writerow([line])
         writer.writerow(["Quality Summary"])
         writer.writerow([""])
-        writer.writerow(["Sample ID",  "Mean quality", "Expected organism", "Identified organism", "% Match", "Coverage Depth", "Required depth", "CheckM completeness", "CheckM contamination", "Overall Quality"])
-        for line in temp_sum:
+        writer.writerow(["Sample ID",  "Mean quality", "Expected organism", "Identified organism", "% Match", "Coverage Depth", "Required depth", "CheckM completeness", "CheckM contamination", "Overall Quality", "Isolate QC", "Control QC"])
+        lines = list(temp_sum)
+        # Stable ordering preserves the sample sheet order within each group.
+        lines.sort(key=lambda line: not is_lambda_control(line.rstrip("\n").split("\t")[3]))
+        for line in lines:
             sample, avqc, qc_verdict, organism, hit, match, coverage, min_depth, cov_verdict, tax_confirm = line.strip().split("\t")
-            if sample in ["Sample", "Lambda"]:
+            if sample == "Sample":
                 continue
-            if sample in checkm_out:
+            control = is_lambda_control(organism)
+            control_qc = tax_confirm.removeprefix("Control") if control and tax_confirm in {"ControlPass", "ControlFail", "ControlError"} else "Not assessed"
+            if control and control_qc == "Not assessed":
+                if not hit.lower().startswith("analysis failed"):
+                    hit = CONTROL_IDENTIFICATION
+                match = "N/A"
+            if sample in checkm_out and not control:
                 completeness, contamination = checkm_out[sample]
-                completeness_verdict = "Pass" if float(completeness) >= min_completeness else "Fail"
-                contamination_verdict = "Pass" if float(contamination) <= max_contamination else "Fail"
+                from bactipipe.qc_status import threshold_verdict
+                completeness_verdict = threshold_verdict(completeness, min_completeness)
+                contamination_verdict = threshold_verdict(contamination, max_contamination, maximum=True)
             else:
                 completeness, contamination = "N/A", "N/A"
-                completeness_verdict = "Fail"
-                contamination_verdict = "Fail"
+                completeness_verdict = "N/A"
+                contamination_verdict = "N/A"
 
-            if any([qc_verdict == "Fail", cov_verdict == "Fail", tax_confirm == "Fail",  completeness_verdict == "Fail", contamination_verdict == "Fail"]):
-                final_verdict = "Fail"
-            else:
-                final_verdict = "Pass"
+            from bactipipe.qc_status import interpret
+            interpretation = interpret(organism, hit, [qc_verdict, cov_verdict,
+                                      completeness_verdict, contamination_verdict],
+                                      isolate_qc_failure=tax_confirm == "Contamination", control_qc=control_qc)
+            final_verdict = interpretation['overall']
+            # Explicit taxonomy review flags may include independently detected
+            # isolate concerns; do not turn those into a silent pass.
+            if tax_confirm in {"Fail", "Review"} and final_verdict == "Pass":
+                final_verdict = "Review"
             coverage = coverage.replace("X", "")
             cov_display = f'{float(coverage):.2f}X' if coverage != 'N/A' else 'N/A'
+            match_display = (
+                "N/A"
+                if str(match).strip().upper() in {"", "N/A", "NA", "NONE", "NULL", "-"}
+                else f"{float(match):.2f}"
+            )
 
-            writer.writerow([sample, f'{float(avqc):.2f}', organism, hit, f"{float(match):.2f}", cov_display, f"{min_depth}X", completeness, contamination, final_verdict])
+            writer.writerow([sample, f'{float(avqc):.2f}', organism, hit, match_display, cov_display, f"{min_depth}X", completeness, contamination, final_verdict, "Fail" if tax_confirm == "Contamination" else "Pass", control_qc if control else "N/A"])
 
             simple_print(f'{sample} :: QC {final_verdict}!\n', final_verdict)
             logger(log, f'{sample} :: QC {final_verdict}!', final_verdict, mode="simple")
@@ -321,7 +384,7 @@ def make_summary(
             logger(log, f'---> CheckM contamination: {contamination}\n', contamination_verdict, mode="simple")
     # Write the pdf summary
     run_name = ""
-    if os.path.exists(qc_summary):
+    if os.path.exists(qc_summary) and not defer_pdf:
         with open(qc_summary, "r") as tsv:
             for line in tsv:
                 if "Run name:" in line:

@@ -5,7 +5,7 @@ from bactipipe.iterative_phylogeny import place_iteratively
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog="bactipipe identify --place", description=__doc__)
     parser.add_argument("--assembly", required=True)
     parser.add_argument("--cache-root", required=True, help="Private persistent cache for this sample")
     parser.add_argument("--reference-root", required=True, help="Immutable GTDB-Tk data directory")

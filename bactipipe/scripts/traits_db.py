@@ -36,6 +36,7 @@ def ensure_and_collect_versions(
     want_vfinder: bool = False,
     want_vfdb: bool = False,
     want_ecoli_vf: bool = False,
+    want_ncbi: bool = False,
     db_root: Optional[str] = None,
 ) -> Dict:
     """
@@ -83,13 +84,15 @@ def ensure_and_collect_versions(
 
     # --- ABRicate (tool) + DBs via `abricate --list` ---
     # Only probe if any abricate-backed DB was requested.
-    if want_vf and (want_vfdb or want_ecoli_vf or want_resfinder or want_card):
+    if want_ncbi or want_resfinder or want_card or (want_vf and (want_vfdb or want_ecoli_vf)):
         ab_ver = _abricate_version()
         if ab_ver:
             tools["abricate"] = ab_ver
 
         # Parse abricate --list once and reuse
         list_map = _abricate_list_versions()
+        if want_ncbi and list_map.get("ncbi"):
+            dbs["ncbi"] = list_map["ncbi"]
 
         if want_vfdb:
             ver = list_map.get("vfdb")

@@ -41,7 +41,12 @@ class DownstreamCohort:
 
     @property
     def reference(self) -> DownstreamSample | None:
+        """First reference for legacy single-reference consumers."""
         return next((sample for sample in self.samples if sample.role == "reference"), None)
+
+    @property
+    def references(self) -> tuple[DownstreamSample, ...]:
+        return tuple(sample for sample in self.samples if sample.role == "reference")
 
     @property
     def signature(self) -> str:
@@ -241,6 +246,11 @@ def _build_cohort(cohort_id: str, records: list[dict[str, str]]) -> DownstreamCo
             f"Cohort {cohort_id!r}: other_organism may be used only when organism is Other."
         )
 
+    # Sort only explicit display names; unnamed rows retain worksheet order.
+    records = sorted(records, key=lambda r: (
+        (r.get('role') or 'sample').casefold() != 'reference',
+        not bool(r.get('display_name')), (r.get('display_name') or '').casefold(),
+    ))
     samples = []
     for record in records:
         row_number = record["_row_number"]
@@ -269,8 +279,6 @@ def _build_cohort(cohort_id: str, records: list[dict[str, str]]) -> DownstreamCo
     if len(sample_ids) != len(set(sample_ids)):
         raise DownstreamManifestError(f"Cohort {cohort_id!r}: duplicate sample IDs are not allowed.")
     references = [sample for sample in samples if sample.role == "reference"]
-    if len(references) > 1:
-        raise DownstreamManifestError(f"Cohort {cohort_id!r}: only one reference is allowed.")
     if command == "detect" and references:
         raise DownstreamManifestError(f"Cohort {cohort_id!r}: reference applies only to relate.")
     invalid_references = [
@@ -291,7 +299,7 @@ def _build_cohort(cohort_id: str, records: list[dict[str, str]]) -> DownstreamCo
         raise DownstreamManifestError(
             f"Cohort {cohort_id!r}: use reference_name or reference_path, not both."
         )
-    if command == "relate" and len(samples) < 2:
+    if command == "relate" and len(samples) < 2 and _cohort_option(records, 'run_ska', 'bool', cohort_id) is not False:
         raise DownstreamManifestError(f"Cohort {cohort_id!r}: relate requires at least two samples.")
 
     options = {

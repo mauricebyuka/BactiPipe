@@ -6,7 +6,7 @@ from bactipipe.placement_visuals import render_tree, render_ani, shared_referenc
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__)
+    p=argparse.ArgumentParser(prog="bactipipe identify --render", description=__doc__)
     p.add_argument('--tree',help='Saved compact Newick')
     p.add_argument('--query-name',default='query',help='Exact leaf identifier in Newick')
     p.add_argument('--sample',required=True,help='Displayed sample name')

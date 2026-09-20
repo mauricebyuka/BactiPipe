@@ -238,6 +238,7 @@ def excel_reader(filepath: str, platform: str = "nanopore"):
     for i in range(n_rows - header_lines + 1):
         if header_lines == 1:
             row_vals = [normalize(x) for x in raw.iloc[i]]
+            row_vals = ['Native Barcode Index' if x == 'NB Index' else x for x in row_vals]
         else:
             top = [normalize(x) for x in raw.iloc[i]]
             bot = [normalize(x) for x in raw.iloc[i + 1]]
@@ -1454,8 +1455,13 @@ def render_pdf_type_genomes_full(
     story.append(Spacer(1, 8))
 
     # ---------- Render each section ----------
-    for idx, (sec_title, rows) in enumerate(sections):
-        heading = "Strain Relatedness Summary" if idx == 0 else (sec_title or "Section")
+    from bactipipe.relatedness_columns import reference_column_groups, report_sections
+    from reportlab.platypus import PageBreak
+    from xml.sax.saxutils import escape
+    for idx, (sec_title, rows, page_break) in enumerate(report_sections(sections)):
+        if page_break:
+            story.append(PageBreak())
+        heading = sec_title or "Strain Relatedness Summary"
         story.append(Paragraph(heading, section_h))
 
         if not rows or not rows[0]:
@@ -1473,6 +1479,7 @@ def render_pdf_type_genomes_full(
             else:
                 raw_hdr.append("" if h is None else str(h))
         hdr_norm = [s.strip().lower() for s in raw_hdr]
+        comparison_start, reference_labels = reference_column_groups(raw_hdr)
 
         def _pos_exact(name: str) -> int:
             """Exact (case-insensitive) lookup against the original header row."""
@@ -1501,6 +1508,8 @@ def render_pdf_type_genomes_full(
         ani_idx      = _pos_any("ani (%)", "ani", "ani percent")
 
         numeric_cols = {i for i in (size_idx, gc_idx, mlst_idx, cgmlst_idx, snp_idx, ani_idx) if i >= 0}
+        if reference_labels:
+            numeric_cols.update(range(comparison_start, len(raw_hdr)))
 
 
         # === 2️⃣ Then build body_rows (uses specimen_idx & numeric_cols) ===
@@ -1511,11 +1520,11 @@ def render_pdf_type_genomes_full(
             for j, val in enumerate(row):
                 s = "" if val is None else str(val)
                 if j in wrap_cols:
-                    formatted_row.append(Paragraph(s, cell_p))
+                    formatted_row.append(Paragraph(escape(s), cell_p))
                 elif j in numeric_cols:
-                    formatted_row.append(Paragraph(f"<para align='center'>{s}</para>", cell_p))
+                    formatted_row.append(Paragraph(f"<para align='center'>{escape(s)}</para>", cell_p))
                 else:
-                    formatted_row.append(s)
+                    formatted_row.append(Paragraph(escape(s), cell_p))
             body_rows.append(formatted_row)
 
         # ----- Canonicalize header *display* labels (PDF only) -----
@@ -1547,8 +1556,10 @@ def render_pdf_type_genomes_full(
         # Build header cells with per-column alignment
         header_cells = []
         for j, h in enumerate(raw_headers):
+            if reference_labels and j >= comparison_start:
+                h = 'SNP distance' if (j - comparison_start) % 2 == 0 else 'ANI (%)'
             key = h.strip().lower()
-            display = canonical_map.get(key, h)
+            display = canonical_map.get(key, escape(h))
 
             # Center only for numeric columns; else left align
             hdr_style = header_cell_center if j in numeric_cols else header_cell_left
@@ -1559,8 +1570,25 @@ def render_pdf_type_genomes_full(
 
         # Column widths: compute and fit
         col_widths_tbl = _column_widths(table_data, doc.width)
-
-        tbl = Table(table_data, colWidths=col_widths_tbl, repeatRows=1, hAlign="LEFT")
+        if reference_labels:
+            comparison_width = sum(col_widths_tbl[comparison_start:]) / (2 * len(reference_labels))
+            col_widths_tbl[comparison_start:] = [comparison_width] * (2 * len(reference_labels))
+        spans = []
+        header_count = 1
+        if reference_labels:
+            groups = [''] * len(header_cells)
+            groups[0] = Paragraph('Sample information', header_cell_left)
+            spans.append(('SPAN', (0, 0), (comparison_start-1, 0)))
+            for i, label in enumerate(reference_labels):
+                col = comparison_start + 2*i
+                groups[col] = Paragraph(escape(label), header_cell_center)
+                spans.append(('SPAN', (col, 0), (col+1, 0)))
+            table_data.insert(0, groups)
+            header_count = 2
+        tbl = Table(table_data, colWidths=col_widths_tbl, repeatRows=header_count, hAlign="LEFT")
+        tbl.setStyle(TableStyle(spans + [
+            ('BACKGROUND', (0, 0), (-1, header_count-1), colors.lightgrey),
+        ]))
         tbl.setStyle(TableStyle([
             # Body text
             ("FONT", (0, 1), (-1, -1), "Helvetica", 10),
@@ -1643,17 +1671,16 @@ def _read_tsv_to_map(path: Path, key_col: int = 0, val_col: int = 1) -> Dict[str
     m: Dict[str, str] = {}
     if not path or not path.exists():
         return m
-    for row in csv.reader(path.open("r"), delimiter="\t"):
-        if not row:
-            continue
-        if row[0].startswith("#"):
-            continue
-        if len(row) <= max(key_col, val_col):
-            continue
-        k = row[key_col].strip()
-        v = row[val_col].strip()
-        if k and k.lower() != "sample":
-            m[k] = v
+    with path.open("r") as handle:
+        for row in csv.reader(handle, delimiter="\t"):
+            if not row or row[0].startswith("#"):
+                continue
+            if len(row) <= max(key_col, val_col):
+                continue
+            k = row[key_col].strip()
+            v = row[val_col].strip()
+            if k and k.lower() != "sample":
+                m[k] = v
     return m
 
 def triangular_matrix_from_pairs(
@@ -1753,6 +1780,7 @@ def write_final_summary(
     logger,
     reference_provided: Optional[bool] = None,
     has_reference: Optional[bool] = None,   # alias
+    reference_comparisons=None,
 ) -> Path:
     """
     Compose the consolidated final TSV at:
@@ -1768,6 +1796,11 @@ def write_final_summary(
     """
     if has_reference is None:
         has_reference = bool(reference_provided)
+    comparisons = reference_comparisons
+    if comparisons is None:
+        comparisons = ([dict(sample_id=manifest[0].sample, ani_tsv=paths.get('ani_tsv'),
+                             ska_vs_ref=paths.get('ska_vs_ref'))] if has_reference and manifest else [])
+    has_reference = bool(comparisons)
 
     outdir = paths["outdir"]
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1837,17 +1870,12 @@ def write_final_summary(
     sero_map = _read_tsv_to_map(paths.get("serotypes_tsv")) if paths.get("serotypes_tsv") else {}
     st_map   = _read_tsv_to_map(paths.get("mlst_tsv"))      if paths.get("mlst_tsv")      else {}
     cgst_map = _read_tsv_to_map(paths.get("cgmlst_tsv"))    if paths.get("cgmlst_tsv")    else {}
-    ani_map  = _read_tsv_to_map(paths.get("ani_tsv")) if (has_reference and paths.get("ani_tsv") and paths["ani_tsv"].exists()) else {}
-
-    # SKA vs-ref (sample -> snps)
-    ska_vs_ref_map: Dict[str, str] = {}
-    if has_reference and paths.get("ska_vs_ref") and paths["ska_vs_ref"].exists():
-        with paths["ska_vs_ref"].open("r") as fh:
-            for row in csv.reader(fh, delimiter="\t"):
-                if not row or row[0].lower() == "sample":
-                    continue
-                if len(row) >= 2:
-                    ska_vs_ref_map[row[0].strip()] = row[1].strip()
+    comparison_maps = []
+    for comparison in comparisons:
+        def metric_map(key):
+            path = comparison.get(key)
+            return _read_tsv_to_map(path) if path and path.exists() else {}
+        comparison_maps.append((comparison['sample_id'], metric_map('ska_vs_ref'), metric_map('ani_tsv')))
 
     # GC (%) and Size (Mb) from assembly summary
     gc_map   = _read_gc_map_from_assembly(paths.get("assembly_summary_tsv")) if paths.get("assembly_summary_tsv") else {}
@@ -1860,10 +1888,10 @@ def write_final_summary(
         # Title row
         w.writerow(["## Strain Relatedness Summary"])
 
-        if has_reference:
-            header = ["Sample", "Isolate", "Specimen", "Size (Mb)", "GC (%)", "Serotype", "ST", "cgST", "SNP distance", "ANI (%)"]
-        else:
-            header = ["Sample", "Isolate", "Specimen", "Size (Mb)", "GC (%)", "Serotype", "ST", "cgST"]
+        header = ["Sample", "Isolate", "Specimen", "Size (Mb)", "GC (%)", "Serotype", "ST", "cgST"]
+        for ref_id, _, _ in comparison_maps:
+            prefix = f'{ref_id}: ' if len(comparisons) > 1 else ''
+            header += [prefix + 'SNP distance', prefix + 'ANI (%)']
         w.writerow(header)
 
         ref_sample = manifest[0].sample if (has_reference and manifest) else None
@@ -1883,10 +1911,10 @@ def write_final_summary(
 
             row = [s, iso, spe, size_mb, gc_pct, sero, st, cgst]
 
-            if has_reference:
-                is_ref = (s == ref_sample)
-                ani_raw = "-" if is_ref else ani_map.get(s, "-")
-                snp_raw = "-" if is_ref else ska_vs_ref_map.get(s, "-")
+            for ref_id, ska_vs_ref_map, ani_map in comparison_maps:
+                is_ref = (s == ref_id)
+                ani_raw = "-" if is_ref else ani_map.get(s, "NA")
+                snp_raw = "-" if is_ref else ska_vs_ref_map.get(s, "NA")
                 ani_fmt = _fmt_pct_or_dash(ani_raw, nd=2)
                 snp_fmt = _fmt_int_commas_or_dash(snp_raw)
                 row += [snp_fmt, ani_fmt]

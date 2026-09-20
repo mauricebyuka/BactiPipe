@@ -116,7 +116,7 @@ def write_run_summary(all_merged: Dict[str, Dict[str, List[Dict[str, str]]]], ou
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=schema, delimiter="\t")
         w.writeheader()
-        for sample, merged in sorted(all_merged.items()):
+        for sample, merged in all_merged.items():
             for r in merged.get("amr", []) or []:
                 w.writerow({
                     "sample": sample,
@@ -218,7 +218,7 @@ def _base_token(s: str) -> str:
 
 
 def _samples_in_run(all_merged: Dict[str, Dict[str, List[Dict[str, str]]]]) -> List[str]:
-    return sorted(all_merged.keys())
+    return list(all_merged.keys())
 
 
 def _vf_presence(all_merged: Dict[str, Dict[str, List[Dict[str, str]]]]) -> Dict[str, Set[str]]:

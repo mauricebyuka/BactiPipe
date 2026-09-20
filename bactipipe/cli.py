@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
 import sys
-import shlex
-from shutil import which
 import subprocess
 import os
 
@@ -12,7 +10,6 @@ from bactipipe.scripts.core import (
     update_databases,
     update_packages,
     check_updates,
-    DB_ROOT,
 )
 
 def main():
@@ -30,19 +27,8 @@ def main():
     relate             :  Run genome typing and strain relatedness analysis.
     detect             :  Detect virulence and antimicrobial resistance genes in assemblies.
     identify           :  Identify an assembled bacterial genome with ANI/AF evidence.
-    place-assembly     :  Run cached marker placement separately from QC reporting.
-    render-placement   :  Redraw retained tree and ANI figures without reanalysis.
-    build-identify-db  :  Build an inactive reviewed species-reference candidate.
-    plan-identify-refs :  Propose canonical references from NCBI assembly reports.
-    plan-identify-inventory :  Propose veterinary and near-neighbor assembly accessions.
-    fetch-identify-reports :  Fetch current NCBI reports for proposed assemblies.
-    reconcile-identify-inventory :  Resolve current accessions and canonical fallbacks.
-    download-identify-refs :  Download reconciled assemblies and write a reviewed manifest.
-    augment-identify-inventory :  Add audited controlled-gap reference candidates.
-    write-identify-manifest :  Validate downloads and write the final candidate manifest.
-    validate-identify-manifest :  Verify all candidate references, roles, and checksums.
-    validate-identify-db :  Verify an immutable production or candidate database.
-    prepare-speciesfinder-db :  Prepare the official bacterial SpeciesFinder candidate database.
+                          --place: cached marker placement/confirmation.
+                          --render: redraw retained tree and ANI figures.
 
     Package / Environment Management:
     check-updates      :  Check for available updates to environments and databases.
@@ -52,7 +38,9 @@ def main():
     list-db            :  List all databases required by BactiPipe and their installation status.
     update-db <dbs>    :  Install or update one or more databases.
                             Example: update-db virulencefinder,amrfinder,kmerfinder
-                            Use "update-db all" to install/update every database.
+                            Use "update-db all" for the legacy managed databases.
+                            SpeciesFinder: update-db speciesfinder --help
+                            (explicit verified inputs; not included in "all").
 
     Other:
     -v, --version      :  Show the current version of BactiPipe.
@@ -63,7 +51,7 @@ def main():
 
     if len(sys.argv) < 2 or sys.argv[1] in ["-h", "--help"]:
         print(usage)
-        sys.exit(1)
+        sys.exit(0 if len(sys.argv) > 1 else 1)
 
     if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
         print(f"bactipipe {__version__}")
@@ -71,6 +59,22 @@ def main():
 
 
     cmd = sys.argv[1].lower()
+    forwarded = sys.argv[2:]
+    if cmd == "identify":
+        modes = [flag for flag in ("--place", "--render") if flag in forwarded]
+        if len(modes) > 1:
+            sys.stderr.write("Choose only one of identify --place or --render.\n")
+            sys.exit(2)
+        if modes:
+            forwarded = [arg for arg in forwarded if arg != modes[0]]
+            cmd = "place-assembly" if modes[0] == "--place" else "render-placement"
+    if cmd == "update-db" and forwarded and forwarded[0].casefold() == "speciesfinder":
+        forwarded = forwarded[1:]
+        if "--verify" in forwarded:
+            cmd = "validate-identify-db"
+            forwarded = [arg for arg in forwarded if arg != "--verify"]
+        else:
+            cmd = "prepare-speciesfinder-db"
 
     if cmd == "check-updates":
         check_updates()
@@ -89,8 +93,15 @@ def main():
         sys.exit(0)
 
     if cmd == "update-db":
+        if not forwarded or forwarded[0] in ("-h", "--help"):
+            print("Usage: bactipipe update-db <dbs>\n"
+                  "  Legacy databases: cgmlstfinder, mlst, serotypefinder, virulencefinder, amrfinder, abricate, kmerfinder\n"
+                  "  SpeciesFinder preparation: bactipipe update-db speciesfinder --help\n"
+                  "  SpeciesFinder validation: bactipipe update-db speciesfinder --verify --help\n"
+                  "  'all' updates legacy tool-managed databases, not immutable SpeciesFinder versions.")
+            sys.exit(0)
         try:
-            update_databases(sys.argv[2:])
+            update_databases(forwarded)
             sys.exit(0)
         except SystemExit as e:
             # _parse_db_names may raise SystemExit with a message
@@ -136,7 +147,9 @@ def main():
         # Ensure databases are present before running any pipeline
         script_to_run = script_map[cmd]
     # Forward all remaining arguments to the appropriate script
-    run_command = ["python3", script_to_run] + sys.argv[2:]
+    # Long historical command names remain accepted but are not advertised as
+    # normal workflow commands. Existing installations and web jobs keep working.
+    run_command = [sys.executable, script_to_run] + forwarded
 
     try:
         subprocess.run(run_command, check=True)

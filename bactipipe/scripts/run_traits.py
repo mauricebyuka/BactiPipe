@@ -5,6 +5,9 @@ from datetime import datetime
 from pathlib import Path
 
 from bactipipe.reproducibility import database_identity, source_identity
+from bactipipe.scripts.traits_organisms import (
+    VF_DATABASES, amrfinder_organism, display_organism_name, parse_amrfinder_organisms, virulence_databases,
+)
 
 # Reuse your existing BactiPipe utilities
 from bactipipe.scripts.utils import time_print, logger as file_logger
@@ -20,13 +23,7 @@ from bactipipe.scripts import (
 VIRAMR_ENV = os.getenv("VIRAMR_ENV", "viramr")
 ABRICATE_ENV = os.getenv("ABRICATE_ENV", "genepid")
 
-SUPPORTED_VF_ORGS = {
-    "Escherichia",
-    "Staphylococcus_aureus",
-    "Enterococcus_faecalis",
-    "Enterococcus_faecium",
-    "Listeria",
-}
+SUPPORTED_VF_ORGS = set(VF_DATABASES)
 
 class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
     def __init__(self, *args, **kwargs):
@@ -45,60 +42,18 @@ def _conda_run(env_name: str, command: list[str]) -> subprocess.CompletedProcess
 
 def _list_amrfinder_organisms() -> list[str]:
     """
-    Return AMRFinderPlus organism tokens (+ 'Listeria'), parsed only from the
+    Return verified AMRFinderPlus organism tokens, parsed only from the
     'Available --organism options:' line, ignoring Software/Database/Running/timing lines.
     """
     cp = _conda_run(VIRAMR_ENV, ["amrfinder", "--list_organisms"])
-    raw = (cp.stdout or "") + "\n" + (cp.stderr or "")
-
-    orgs: set[str] = set()
-    target_prefix = "Available --organism options:"
-    captured_line = None
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith(target_prefix):
-            captured_line = line
-            break
-
-    if captured_line:
-        payload = captured_line.split(":", 1)[-1]
-        for tok in payload.split(","):
-            tok = tok.strip()
-            if tok and all(ch.isalpha() or ch == "_" for ch in tok):
-                orgs.add(tok)
-    else:
-        # Defensive fallback in case output format changes
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or "Possible organisms" in line:
-                line = line.split("Possible organisms:", 1)[-1].strip() if "Possible organisms" in line else ""
-            if not line:
-                continue
-            for piece in line.replace(",", " ").split():
-                piece = piece.strip()
-                if not piece:
-                    continue
-                if piece.lower() in {"amrfinder", "took", "seconds", "to", "complete",
-                                     "available", "database", "software", "running:", "running"}:
-                    continue
-                if all(ch.isalpha() or ch == "_" for ch in piece):
-                    orgs.add(piece)
-
-    orgs.add("Listeria")
-    return sorted(orgs)
+    if cp.returncode != 0:
+        raise RuntimeError("AMRFinderPlus organism query failed: " + (cp.stderr or cp.stdout or "unknown error").strip())
+    return parse_amrfinder_organisms(cp.stdout or "", cp.stderr or "")
 
 def _format_organism_list(orgs: list[str]) -> str:
-    """
-    Format organism list with '*' marking VirulenceFinder supported taxa.
-    """
-    lines = []
-    lines.append("# '*' indicates VirulenceFinder-supported organisms.")
-    for o in orgs:
-        mark = "*" if o in SUPPORTED_VF_ORGS else " "
-        lines.append(f"{mark} {o}")
-    return "\n".join(lines)
+    """One copyable organism per line; tool selection is an internal concern."""
+    names = {display_organism_name(o) for o in set(orgs) | SUPPORTED_VF_ORGS}
+    return "\n".join(sorted(names, key=str.casefold) + ["Other"])
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
@@ -129,13 +84,14 @@ def parse_args(argv=None):
                      default=os.getenv("BACTIPIPE_DB_DIR"),
                      help="Root directory that contains virulencefinder_db, resfinder_db, etc.")
     req.add_argument("--organism",
-                     help="Organism name for tool selection and AMRFinderPlus (-O) (required). Check spelling with --organism-list. if not listed, use genus name only.")
+                     help='Organism name, e.g. Salmonella or "Enterococcus faecium". See --organism-list; use a genus name for an unlisted organism.')
     opt.add_argument("--organism-list",
                      action="store_true",
-                     help="Print organisms supported by AMRFinderPlus & VirulenceFinder and exit.")
+                     help="List organism names and exit.")
 
     opt.add_argument("--threads", type=int, default=8, help="CPU threads")
     opt.add_argument("--jobs", type=int, default=4, help="Maximum samples processed concurrently")
+    opt.add_argument("--sample-order", choices=("display", "sheet"), default="display", help="Report sample order (applies to matrix columns too).")
     # Escape % in help strings for argparse
     opt.add_argument("--min_identity", "--min-identity", dest="min_identity", type=float, default=90.0, help="Minimum %% identity")
     opt.add_argument("--min_coverage", "--min-coverage", dest="min_coverage", type=float, default=60.0, help="Minimum %% coverage")
@@ -167,7 +123,7 @@ def parse_args(argv=None):
     opt.add_argument("-h","--help", action="help", help="Show this help message and exit")
     return p.parse_args(argv)
 
-def _read_sample_sheet(sample_sheet: str, genomes_dir: str) -> list[tuple[str, str, str, str]]:
+def _read_sample_sheet(sample_sheet: str, genomes_dir: str, *, sample_order='display') -> list[tuple[str, str, str, str]]:
     """
     Returns a list of (isolate_id, sample_display, specimen, fasta_path).
     - sample_sheet columns: sample_id \t display_name \t specimen  (no header)
@@ -179,7 +135,7 @@ def _read_sample_sheet(sample_sheet: str, genomes_dir: str) -> list[tuple[str, s
     missing: list[str] = []
     with open(sample_sheet, "r", encoding="utf-8") as fh:
         for ln in fh:
-            ln = ln.strip()
+            ln = ln.rstrip('\r\n')
             if not ln or ln.startswith("#"):
                 continue
             parts = ln.split("\t")
@@ -198,6 +154,10 @@ def _read_sample_sheet(sample_sheet: str, genomes_dir: str) -> list[tuple[str, s
     if not rows:
         sys.stderr.write("ERROR: No valid rows found in --sample_sheet (no matching FASTA files).\n")
         sys.exit(2)
+    if sample_order == 'display':
+        from bactipipe.primary_downstream import report_order
+        rows = report_order(rows)
+    rows = [(sid, display or sid, specimen, fasta) for sid, display, specimen, fasta in rows]
     isolate_ids = [row[0] for row in rows]
     display_names = [row[1] for row in rows]
     if len(isolate_ids) != len(set(isolate_ids)):
@@ -232,8 +192,9 @@ def _run_one(args_pack):
             enable_amrfinder=cfg["amrfinder"],
             enable_resfinder=cfg["resfinder"],
             enable_card=cfg["card"],
+            enable_ncbi=cfg["ncbi"],
             threads=cfg["threads"],
-            organism=cfg["organism"],
+            organism=cfg["amrfinder_organism"] or cfg["organism"],
             logger_fn=logfn,
         )
 
@@ -267,7 +228,11 @@ def main(argv=None):
 
     # --- short-circuit: just list organisms and exit ---
     if args.organism_list:
-        orgs = _list_amrfinder_organisms()
+        try:
+            orgs = _list_amrfinder_organisms()
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(f"ERROR: {exc}\n")
+            sys.exit(2)
         print(_format_organism_list(orgs))
         sys.exit(0)
 
@@ -289,14 +254,17 @@ def main(argv=None):
     os.makedirs(args.outdir, exist_ok=True)
 
     # --- discover samples from sample_sheet (maps isolate -> sample display) ---
-    sample_rows = _read_sample_sheet(args.sample_sheet, args.genomes_dir)
+    sample_rows = _read_sample_sheet(args.sample_sheet, args.genomes_dir, sample_order=args.sample_order)
     # sample_rows: list of (isolate_id, sample_display, specimen, fasta_path)
 
     # --- decide default tool selection per your logic ---
     # AMR defaults: AMRFinderPlus ON (unless virulence-only); ABRicate toggles add-on if flagged
-    amr_amrfinder = (not args.virulence_only)  # default ON when AMR track runs
-    if args.amrfinder:
-        amr_amrfinder = True  # explicit still true
+    supported = _list_amrfinder_organisms() if not args.virulence_only else []
+    amr_organism = amrfinder_organism(args.organism, supported)
+    amr_amrfinder = bool(amr_organism) and not args.virulence_only
+    amr_ncbi = not amr_amrfinder and not args.virulence_only
+    if args.amrfinder and not amr_organism:
+        sys.stderr.write(f"{args.organism}: unsupported AMRFinderPlus organism; using ABRicate/ncbi.\n")
 
     amr_resfinder = bool(args.abricate_resfinder)
     amr_card = bool(args.abricate_card)
@@ -305,10 +273,12 @@ def main(argv=None):
     vf_vfinder = bool(args.virulencefinder)
     vf_vfdb = bool(args.abricate_vfdb)
     if not vf_vfinder and not vf_vfdb:
-        if args.organism.casefold() in {item.casefold() for item in SUPPORTED_VF_ORGS}:
+        if virulence_databases(args.organism):
             vf_vfinder = True
         else:
             vf_vfdb = True
+    if vf_vfinder and not virulence_databases(args.organism):
+        vf_vfinder, vf_vfdb = False, True
 
     # Respect mode flags
     run_amr = not args.virulence_only
@@ -336,6 +306,7 @@ def main(argv=None):
     print(f"AMR detection: {'ON' if run_amr else 'OFF'}")
     if run_amr:
         print(f"  AMRFinderPlus: {'ON' if use_amrfinder else 'OFF'}")
+        print(f"  ABRicate/NCBI: {'ON' if amr_ncbi else 'OFF'}")
         print(f"  ABRicate/ResFinder: {'ON' if use_resfinder else 'OFF'}")
         print(f"  ABRicate/CARD: {'ON' if use_card else 'OFF'}")
     print(f"Virulence detection: {'ON' if run_vf else 'OFF'}")
@@ -347,7 +318,8 @@ def main(argv=None):
 
     # --- versions / db tracking ---
     versions = traits_db.ensure_and_collect_versions(
-        want_amr = run_amr,
+        want_amr = use_amrfinder,
+        want_ncbi = amr_ncbi,
         want_vf  = run_vf,
         want_resfinder = bool(args.abricate_resfinder) and run_amr,
         want_card      = bool(args.abricate_card) and run_amr,
@@ -376,6 +348,8 @@ def main(argv=None):
 
         # Final tool toggles after default logic
         amrfinder=bool(amr_amrfinder),
+        ncbi=bool(amr_ncbi),
+        amrfinder_organism=amr_organism,
         resfinder=bool(amr_resfinder),
         card=bool(amr_card),
 
@@ -452,6 +426,9 @@ def main(argv=None):
             "amr": run_amr,
             "virulence": run_vf,
             "amrfinder": cfg["amrfinder"],
+            "amrfinder_organism": cfg["amrfinder_organism"],
+            "abricate_ncbi": cfg["ncbi"],
+            "virulencefinder_databases": virulence_databases(cfg["organism"]) if cfg["virulencefinder"] else None,
             "abricate_resfinder": cfg["resfinder"],
             "abricate_card": cfg["card"],
             "virulencefinder": cfg["virulencefinder"],

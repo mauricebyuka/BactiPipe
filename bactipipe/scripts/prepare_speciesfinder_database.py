@@ -11,10 +11,12 @@ from bactipipe.speciesfinder_database import prepare_speciesfinder_database
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="bactipipe update-db speciesfinder",
         description=(
             "Prepare the official SpeciesFinder bacterial KMA index for bounded "
             "candidate nomination and exact-template ANI validation."
-        )
+        ),
+        epilog="To verify an existing installation: bactipipe update-db speciesfinder --verify --database-root PATH",
     )
     parser.add_argument("--database-prefix", required=True)
     parser.add_argument("--taxonomy-file", required=True)

@@ -33,6 +33,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
+from bactipipe.scripts.traits_organisms import virulence_databases
 
 # Optional centralized env launcher (recommended)
 try:
@@ -98,35 +99,39 @@ def run_vf_for_sample(
     # --- VirulenceFinder
     if enable_vfinder:
         if not db_root:
-            logger_fn(f"[{sample}] VirulenceFinder SKIP: --db-dir/BACTIPIPE_DB_DIR not set.")
+            raise RuntimeError(f"[{sample}] VirulenceFinder database root is not configured")
         elif not os.path.isdir(vdb):
-            logger_fn(f"[{sample}] VirulenceFinder SKIP: DB not found at: {vdb}")
+            raise RuntimeError(f"[{sample}] VirulenceFinder database not found: {vdb}")
         else:
-            vf_tsv = _run_virulencefinder(sample, fasta, out_root, db_root, logger_fn)
+            databases = virulence_databases(organism)
+            if not databases:
+                raise ValueError(f"No VirulenceFinder database configured for {organism}")
+            vf_tsv = _run_virulencefinder(sample, fasta, out_root, db_root, logger_fn,
+                min_id=min_id / 100, min_cov=min_cov / 100, databases=databases)
             if vf_tsv:
                 rows.extend(_parse_vfinder_results(vf_tsv, min_id, min_cov, vf_map, logger_fn))
             else:
-                logger_fn(f"[{sample}] VirulenceFinder: no results (results_tab.tsv missing or parse yielded 0 rows).")
+                raise RuntimeError(f"[{sample}] VirulenceFinder failed or produced no results table; see its logs")
     else:
         logger_fn(f"[{sample}] VirulenceFinder disabled by flags.")
 
     # --- ABRicate VFDB
     if enable_vfdb:
-        vfdb_tsv = _run_abricate(sample, fasta, out_root, db="vfdb", threads=threads, logger_fn=logger_fn)
+        vfdb_tsv = _run_abricate(sample, fasta, out_root, db="vfdb", threads=threads, logger_fn=logger_fn, min_id=min_id, min_cov=min_cov)
         if vfdb_tsv:
             rows.extend(_parse_abricate(vfdb_tsv, source_label="VFDB", min_id=min_id, min_cov=min_cov, vf_map=vf_map, logger_fn=logger_fn))
         else:
-            logger_fn(f"[{sample}] ABRicate(VFDB): no results TSV.")
+            raise RuntimeError(f"[{sample}] ABRicate/VFDB failed or produced no results table; see its logs")
     else:
         logger_fn(f"[{sample}] ABRicate(VFDB) disabled by flags.")
 
     # --- ABRicate ecoli_vf
     if enable_ecoli_vf:
-        ecoli_tsv = _run_abricate(sample, fasta, out_root, db="ecoli_vf", threads=threads, logger_fn=logger_fn)
+        ecoli_tsv = _run_abricate(sample, fasta, out_root, db="ecoli_vf", threads=threads, logger_fn=logger_fn, min_id=min_id, min_cov=min_cov)
         if ecoli_tsv:
             rows.extend(_parse_abricate(ecoli_tsv, source_label="ecoli_vf", min_id=min_id, min_cov=min_cov, vf_map=vf_map, logger_fn=logger_fn))
         else:
-            logger_fn(f"[{sample}] ABRicate(ecoli_vf): no results TSV.")
+            raise RuntimeError(f"[{sample}] ABRicate/ecoli_vf failed or produced no results table; see its logs")
     else:
         logger_fn(f"[{sample}] ABRicate(ecoli_vf) disabled by flags.")
 
@@ -281,6 +286,8 @@ def _run_abricate(
     db: str,
     threads: int,
     logger_fn,
+    min_id: float = 90,
+    min_cov: float = 60,
 ) -> str | None:
     """
     Run ABRicate for a specific DB (vfdb or ecoli_vf). Returns path to TSV on success.
@@ -300,6 +307,7 @@ def _run_abricate(
         cmd = ["abricate", "--db", db]
     if threads and threads > 1:
         cmd += ["--threads", str(threads)]
+    cmd += ["--minid", str(min_id), "--mincov", str(min_cov)]
     cmd += [fasta]
 
     logger_fn(f"[{sample}] ABRicate TRY | db={db} | TMP={tmp_dir}")

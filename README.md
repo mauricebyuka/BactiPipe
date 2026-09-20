@@ -6,8 +6,7 @@ BactiPipe provides **end-to-end quality control and genome assembly workflows** 
 
 For a detailed description of the pipeline, workflows, and usage examples, please see the [**BactiPipe Wiki Page**](https://github.com/ADL-genomics/BactiPipe/wiki).  
 
-The current CLI exposes five analysis commands plus reference-planning and
-inactive candidate-building commands:
+The user-facing CLI has five analysis commands:
 
 - `bactipipe qc-illumina` and `bactipipe qc-nanopore` perform read QC, assembly,
   identification, and assembly QC.
@@ -15,24 +14,41 @@ inactive candidate-building commands:
   SKA, and cgMLST analysis on a related cohort of assembled genomes.
 - `bactipipe detect` reports AMR determinants and virulence genes from assembled
   genomes.
-- `bactipipe identify` runs the candidate evidence-based species-identification
+- `bactipipe identify` runs the evidence-based species-identification
   workflow against an explicitly selected database version.
-- `bactipipe plan-identify-inventory` creates a bounded assembly-accession
-  proposal from pinned GTDB metadata and the controlled veterinary catalog.
-- `bactipipe fetch-identify-reports` retrieves current NCBI assembly metadata
-  for that proposal in resumable batches.
-- `bactipipe reconcile-identify-inventory` resolves newer accession versions,
-  suppressed records, canonical fallbacks, and taxonomy-review candidates.
-- `bactipipe augment-identify-inventory` adds only exact-taxid, quality-passing
-  replacements for controlled species that remain absent after reconciliation.
-- `bactipipe download-identify-refs` retrieves accepted multi-contig assemblies
-  in resumable batches and emits a checksum-verified reviewed manifest.
-- `bactipipe build-identify-db` builds an immutable inactive species-reference
-  candidate from a reviewed manifest.
-- `bactipipe prepare-speciesfinder-db` converts the verified official bacterial
-  SpeciesFinder/KMA files into an immutable, inactive BactiPipe database version.
-- `bactipipe validate-identify-db` verifies either supported immutable database
-  contract and its activation state.
+
+Separate placement and figure redrawing are options of `identify`:
+`bactipipe identify --place --help` and `bactipipe identify --render --help`.
+These work with local assemblies and retained evidence; no web application is required.
+
+Prepare a verified SpeciesFinder installation with
+`bactipipe update-db speciesfinder --help`. The existing required index, taxonomy,
+archive checksum and output-root options are unchanged. This does not download
+another large database or activate a candidate automatically. Validate with
+`bactipipe update-db speciesfinder --verify --database-root PATH` (add
+`--allow-candidate` for an inactive installation). `update-db all` continues to
+update only the legacy tool-managed databases, not immutable SpeciesFinder versions.
+
+Long historical database-planning/build commands and `place-assembly`,
+`render-placement`, `prepare-speciesfinder-db`, `validate-identify-db` remain
+accepted compatibility aliases, but are no longer advertised in ordinary help.
+The older custom-reference inventory builders are maintenance/experimental tools,
+not steps required to run QC, relate, detect or identify on a workstation.
+
+`bactipipe detect --organism-list` prints one simple organism name per line, with
+no tool/database table. For example, use `--organism Salmonella` or
+`--organism "Enterococcus faecium"`. Species distinctions are retained when
+needed, and older underscore names remain accepted. Tool selection is internal.
+Only an exact supported AMRFinderPlus organism (ignoring case and
+space/underscore differences, plus reviewed legacy group aliases) is passed to its `-O` option. Other organisms use
+ABRicate `--db ncbi` without an organism option. Enterococcus uses VirulenceFinder
+`virulence_ent`; faecium/lactis additionally use `virulence_entfm_entls`. Other
+VirulenceFinder-supported groups retain their organism-specific databases;
+unsupported groups use ABRicate `--db vfdb`. The existing Escherichia combined
+VirulenceFinder/VFDB/ecoli_vf policy is preserved. ResFinder/CARD remain opt-in.
+AMR-only and virulence-only modes remain independent. ABRicate/NCBI is a gene
+screen, not equivalent to AMRFinderPlus organism-specific mutation screening;
+outputs record the actual tools/databases. A failed tool is not a negative result.
 
 The new identification workflow is not yet the production QC default. The
 current candidate uses only the assembly FASTA for SpeciesFinder/KMA to nominate a bounded set of taxa and
@@ -62,6 +78,30 @@ For controlled Nanopore reanalysis, `--input-run-name SOURCE_RUN` reuses that
 physical input directory while `--run_name` continues to name the independent
 output. This is primarily used by the web application's Admin-only benchmark
 workflow.
+
+## Primary-sheet downstream requests and report ordering
+
+The web integration can derive downstream cohorts from the primary QC workbook's
+`R/D*` column: `D` requests detection, and `R1`–`R4` request relatedness using
+reference-library names in F5:F8 (labels in E5:E8). A blank request means QC only.
+Multiple reference names, separated by commas, semicolons or newlines, share one
+cohort with separate SNP-distance/ANI column pairs. Combined requests such as `R1,D` are supported. An explicit
+downstream manifest takes precedence over these automatic requests.
+
+The shared adapter is `bactipipe.primary_downstream.primary_downstream_tsv`.
+Standalone QC commands do not automatically schedule downstream work; `relate`
+and `detect` remain separate CLI commands consuming assemblies and command sheets.
+Both commands sort report samples by supplied display name, followed by unnamed
+samples in sheet order; `--sample-order sheet` preserves the entire input order.
+Reference rows remain first. `relate --reference-specimen TEXT` sets the reference
+row's Specimen label; the web application supplies its reference-library Display name.
+Repeat `--reference`, `--reference-id` and `--reference-specimen` in matching order
+for multiple references. Typing runs once per genome and SKA once per cohort;
+ANI is calculated against each reference. All references remain at the top of the
+consolidated table. PDFs display two reference pairs per panel, continuing onto
+another page when needed; the TSV keeps every pair side by side. Multi-reference
+`analysis_result.json` uses `bactipipe-relate-v2` with explicit reference IDs and
+evidence paths. Single-reference columns and invocations remain compatible.
 
 ## Controlled organism sizes
 

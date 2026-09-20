@@ -6,6 +6,24 @@ Releases follow [Semantic Versioning](VERSIONING.md), and Git tags use the
 
 ## Unreleased
 
+- Correct detect organism-list parsing and show a plain, copyable list of readable
+  organism names instead of tool/database details; accept legacy group aliases.
+  Unsupported AMRFinder organism names now select ABRicate/NCBI without `-O`;
+  Enterococcus uses the appropriate VirulenceFinder subsets, with VFDB fallback
+  for unsupported virulence organisms. Preserve actual database provenance and
+  propagate virulence-tool failures instead of silently reporting no hits.
+- Simplify ordinary CLI help to five analysis commands; expose placement/rendering
+  through identify options and SpeciesFinder preparation/validation through
+  update-db speciesfinder. Retain historical command aliases for compatibility.
+
+- Convert optional primary-QC workbook R/D requests to downstream cohorts with
+  organism-aware defaults and reference selectors. Multiple references share one
+  typing pass, a single SKA cohort calculation, and consolidated SNP/ANI column pairs
+  in TSV/PDF reports; accept repeatable CLI reference flags and retain per-reference
+  evidence in the relate-v2 contract.
+  Sort downstream reports by supplied display names with worksheet-order fallback;
+  accept a reference Specimen description and the QC NB Index header alias.
+
 - Emit opt-in timestamped QC/assembly milestones and bounded resource/workload
   metadata for execution-duration auditing; forward parallel Illumina worker
   events live without changing ordinary CLI output or analytical results.

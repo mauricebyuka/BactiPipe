@@ -155,7 +155,7 @@ def _check_tool(
         return False
     return True
 
-def _read_sample_sheet(path: Path, logger: logging.Logger) -> List[Tuple[str, str, str]]:
+def _read_sample_sheet(path: Path, logger: logging.Logger, *, sample_order='display') -> List[Tuple[str, str, str]]:
     rows: List[Tuple[str, str, str]] = []
     if not path.exists():
         raise FileNotFoundError(f"Sample sheet not found: {path}")
@@ -180,6 +180,10 @@ def _read_sample_sheet(path: Path, logger: logging.Logger) -> List[Tuple[str, st
             rows.append((sample, isolate, specimen))
     if not rows:
         raise ValueError("Sample sheet appears empty after parsing valid rows.")
+    if sample_order == 'display':
+        from bactipipe.primary_downstream import report_order
+        rows = report_order(rows)
+    rows = [(sample, isolate or sample, specimen) for sample, isolate, specimen in rows]
     sample_ids = [row[0] for row in rows]
     display_names = [row[1] for row in rows]
     if len(sample_ids) != len(set(sample_ids)):
@@ -248,11 +252,34 @@ def _first_fasta_id(fa: Path) -> str:
                 return line[1:].strip().split()[0]
     return fa.stem  # fallback
 
+def resolve_reference_arguments(args):
+    """Validate positional association of repeatable reference flags."""
+    references = args.reference or []
+    ids = args.reference_id or []
+    specimens = args.reference_specimen or []
+    for label, values in (('--reference-id', ids), ('--reference-specimen', specimens)):
+        if values and len(values) != len(references):
+            raise ValueError(f'{label} must be supplied once per --reference, or omitted entirely.')
+    records, seen_ids, seen_paths = [], set(), set()
+    for i, path in enumerate(references):
+        if not path.is_file():
+            raise FileNotFoundError(f'Reference FASTA not found: {path}')
+        sid = ids[i] if ids else _first_fasta_id(path)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', sid):
+            raise ValueError(f'Unsafe reference ID {sid!r}; provide --reference-id.')
+        if sid in seen_ids or path.resolve() in seen_paths:
+            raise ValueError('Reference IDs and reference FASTA paths must be unique.')
+        seen_ids.add(sid); seen_paths.add(path.resolve())
+        records.append((path, sid, specimens[i] if specimens else 'reference'))
+    return records
+
+
 def _prepend_reference_to_manifest(
     manifest: List[SampleRecord],
     reference_fa: Path,
     sample_id: Optional[str],
     logger: logging.Logger,
+    specimen: str = 'reference',
 ) -> List[SampleRecord]:
     """Ensure the reference is row 1; if it already exists (by ID or path), move it to front."""
     sid = sample_id or _first_fasta_id(reference_fa)
@@ -272,18 +299,21 @@ def _prepend_reference_to_manifest(
     if idx is not None:
         # move existing record to front; don't duplicate
         rec = manifest.pop(idx)
+        if rec.genome_path.resolve() != ref_path or rec.sample != sid:
+            raise ValueError(f"Reference ID {sid!r} collides with a different sample assembly.")
+        rec.isolate = 'reference'
+        rec.specimen = specimen
         logger.info(f"Reference '{sid}' already present; moved to first row.")
         return [rec] + manifest
 
     # otherwise create a new record and prepend
     if not reference_fa.exists():
-        logger.error(f"Reference FASTA not found: {reference_fa}")
-        return manifest
+        raise FileNotFoundError(f"Reference FASTA not found: {reference_fa}")
 
     ref_rec = SampleRecord(
         sample=sid,
         isolate="reference",
-        specimen="reference",
+        specimen=specimen,
         genome_path=reference_fa,
         exists=True,
         notes=""
@@ -810,8 +840,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     req.add_argument("--sample-sheet", type=Path, help="4-column TSV. Default: try common Dropbox locations.")
     opt.add_argument("--outdir", type=Path, help="Output directory. Default: ./bactipipe_relate_output/Typing_<run-name>/<accession>")
     opt.add_argument("--tmpdir", type=Path, help="Temporary work directory. Default: <outdir>/tmp")
-    opt.add_argument("--reference", type=Path, help="Optional reference genome (treated as first sample).")
-    opt.add_argument("--reference-id", help="Optional sample ID for the reference. If omitted, uses the first FASTA header ID.")
+    opt.add_argument("--reference", type=Path, action="append", help="Reference genome; repeat for multiple references in one cohort.")
+    opt.add_argument("--reference-id", action="append", help="Reference sample ID; repeat in the same order as --reference, or omit all to use FASTA IDs.")
+    opt.add_argument("--reference-specimen", action="append", help="Reference Specimen label; repeat in the same order as --reference.")
+    opt.add_argument("--sample-order", choices=("display", "sheet"), default="display", help="Report order: display names (unnamed rows keep sheet order), or input sheet order.")
     opt.add_argument("--ani-tool", choices=["auto", "skani", "fastani"], default="auto",
                    help="ANI vs reference tool (auto prefers skani, else fastANI).")
     opt.add_argument("--db-dir", type=Path, help="DB root directory. Defaults to $BACTIPIPE_DB_DIR")
@@ -919,7 +951,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "sample_sheet": str(sample_sheet.resolve()),
         "outdir": str(outdir.resolve()),
         "tmpdir": str(tmpdir.resolve()),
-        "reference": str(args.reference.resolve()) if args.reference else None,
+        "reference": str(args.reference[0].resolve()) if args.reference else None,
+        "references": [str(p.resolve()) for p in args.reference or []],
         "db_dir": str(db_dir.resolve()),
         "mlst_db_dir": str(mlst_db_dir) if need_mlst else None,
         "cgmlst_db_dir": str(cgmlst_db_dir) if need_cgmlst else None,
@@ -1028,20 +1061,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Persist manifest + run config
     manifest_path = outdir / f"{accession}_manifest.tsv"
 
-    if args.resume and manifest_path.exists():
-        manifest = _load_manifest_tsv(manifest_path, logger)
-    else:
-        # fresh build from sample sheet
-        try:
-            rows = _read_sample_sheet(sample_sheet, logger)
-        except Exception as e:
-            logger.exception(f"Failed to read sample sheet: {e}")
-            return 2
+    # Always resolve current sheet/reference membership. Resume applies to the
+    # per-genome tool outputs, never to an obsolete cohort manifest.
+    try:
+        rows = _read_sample_sheet(sample_sheet, logger, sample_order=args.sample_order)
         manifest = _build_manifest(rows, assemblies_dir, logger)
-        if args.reference:
-            manifest = _prepend_reference_to_manifest(manifest, args.reference, args.reference_id, logger)
-        # persist only on fresh build (resume keeps prior)
-        _write_manifest(manifest, manifest_path, logger)
+        reference_specs = resolve_reference_arguments(args)
+        for ref_path, ref_id, specimen in reversed(reference_specs):
+            manifest = _prepend_reference_to_manifest(manifest, ref_path, ref_id, logger, specimen=specimen)
+    except (ValueError, OSError) as exc:
+        logger.error("Invalid sample sheet or references: %s", exc)
+        return 2
+    _write_manifest(manifest, manifest_path, logger)
+
+    reference_ids = [sid for _, sid, _ in reference_specs]
+    paths = _make_paths(accession, outdir, tmpdir)
+    reference_comparisons = [
+        dict(sample_id=sid,
+             ani_tsv=paths['ani_tsv'] if len(reference_ids) == 1 else outdir / f'{accession}_ani_ref{i+1}.tsv',
+             ska_vs_ref=paths['ska_vs_ref'] if len(reference_ids) == 1 else paths['ska_root'] / f'{accession}_ska_ref{i+1}.tsv')
+        for i, sid in enumerate(reference_ids)
+    ]
 
     # --- SKA preflight (fail fast if enabled but unusable) ---
     if not args.no_ska:
@@ -1061,8 +1101,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ska_root = outdir / "ska"  
         ska_filelist = None
 
-    # Prepare paths for outputs
-    paths = _make_paths(accession, outdir, tmpdir)
+    # Retain the checked file list in output provenance.
     if ska_filelist is not None:
         paths["ska_filelist"] = ska_filelist
 
@@ -1153,17 +1192,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.no_ani:
         if args.reference:
             with _step(logger, "ANI vs reference (skani/fastANI)"):
-                write_reference_ani_table(
-                    manifest=manifest,
-                    reference_index=0,
-                    ani_tool=args.ani_tool,
-                    out_tsv=paths["ani_tsv"],
-                    workdir=paths["ani_pairs_dir"],
-                    logger=logger,
-                    skani_env=ani_env_skani,
-                    fastani_env=ani_env_fastani,
-                )
-                logger.info(f"  ANI table: {paths['ani_tsv']}")
+                for comparison in reference_comparisons:
+                    write_reference_ani_table(
+                        manifest=manifest,
+                        reference_index=next(i for i, rec in enumerate(manifest) if rec.sample == comparison['sample_id']),
+                        ani_tool=args.ani_tool,
+                        out_tsv=comparison['ani_tsv'],
+                        workdir=paths["ani_pairs_dir"], logger=logger,
+                        skani_env=ani_env_skani, fastani_env=ani_env_fastani,
+                    )
         else:
             with _step(logger, "ANI triangle (skani all-vs-all)"):
                 # 1) Build (sample_name, fasta_path) list
@@ -1216,14 +1253,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if dist_path and dist_path.exists():
                 # Optional vs-reference table
                 if args.reference:
-                    ska2.write_ska_vs_reference(
-                        distances_tsv=dist_path,
-                        reference_sample=manifest[0].sample,   # reference is first row
-                        out_tsv=paths["ska_vs_ref"],
-                        logger=logger,
-                        sample_order=[rec.sample for rec in manifest if rec.exists],
-                    )
-                    logger.info(f"  SKA vs-ref: {paths['ska_vs_ref']}")
+                    for comparison in reference_comparisons:
+                        ska2.write_ska_vs_reference(
+                            distances_tsv=dist_path,
+                            reference_sample=comparison['sample_id'],
+                            out_tsv=comparison['ska_vs_ref'], logger=logger,
+                            sample_order=[rec.sample for rec in manifest if rec.exists],
+                        )
 
                 # Matrices
                 sample_order = [rec.sample for rec in manifest if rec.exists]
@@ -1242,13 +1278,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     write_assembly_summary(manifest, paths["assembly_summary_tsv"], logger)
 
     with _step(logger, "Final summary table"):
-        ska_ref_available = bool(args.reference) and (not args.no_ska) and paths["ska_vs_ref"].exists()
         final_path = U.write_final_summary(
             accession=accession,
             manifest=manifest,
             paths=paths,
             logger=logger,
             reference_provided=bool(args.reference),
+            reference_comparisons=[dict(c, ani_tsv=None if args.no_ani else c['ani_tsv'],
+                                       ska_vs_ref=None if args.no_ska else c['ska_vs_ref'])
+                                   for c in reference_comparisons],
         )
 
     # Final summary to console
@@ -1263,7 +1301,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info(f"GC TSV:       {paths['gc_tsv']}")
     logger.info(f"Assembly summary TSV: {paths['assembly_summary_tsv']}")
     if args.reference:
-        logger.info(f"ANI vs reference: {paths['ani_tsv']}")
+        for comparison in reference_comparisons:
+            logger.info(f"ANI vs {comparison['sample_id']}: {comparison['ani_tsv']}")
     
     # === PDF report ===
     if not args.no_pdf:
@@ -1285,6 +1324,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "ska": getattr(args, "ska_env", None),
                 },
             )
+            if reference_comparisons:
+                used.pop('skani', None)
+                for comparison in reference_comparisons:
+                    if args.no_ani or not comparison['ani_tsv'].is_file():
+                        continue
+                    with comparison['ani_tsv'].open() as handle:
+                        for evidence in csv.DictReader(handle, delimiter='\t'):
+                            tool = evidence.get('tool')
+                            if tool in {'skani', 'fastANI'} and evidence.get('ANI') not in {'-', 'NA', ''}:
+                                used[tool] = dict(exe=tool, env=ani_env_skani if tool == 'skani' else ani_env_fastani)
             versions = U.collect_tool_versions(used, logger)
 
             final_tsv = outdir / f"{accession}_relate.tsv"
@@ -1303,7 +1352,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     completed_at = datetime.now().astimezone()
     result_payload = {
         "schema_version": 1,
-        "output_contract_version": "bactipipe-relate-v1",
+        "output_contract_version": "bactipipe-relate-v2" if len(reference_ids) > 1 else "bactipipe-relate-v1",
         "pipeline": source_identity(),
         "database": database_identity(db_dir),
         "command": "relate",
@@ -1314,6 +1363,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
         "reference_sample": manifest[0].sample if args.reference and manifest else None,
+        "reference_samples": reference_ids,
+        "reference_comparisons": [
+            dict(sample_id=c['sample_id'],
+                 ani_tsv=c['ani_tsv'].relative_to(outdir).as_posix() if not args.no_ani else None,
+                 ska_vs_ref=c['ska_vs_ref'].relative_to(outdir).as_posix() if not args.no_ska else None)
+            for c in reference_comparisons
+        ],
         "parameters": {
             "ani": not args.no_ani,
             "ani_tool": args.ani_tool if not args.no_ani else None,
@@ -1327,7 +1383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "sample_id": rec.sample,
                 "isolate": rec.isolate,
                 "specimen": rec.specimen,
-                "is_reference": bool(args.reference and index == 0),
+                "is_reference": rec.sample in reference_ids,
                 "assembly_present": rec.exists,
             }
             for index, rec in enumerate(manifest)
@@ -1340,7 +1396,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "mlst_tsv": f"{accession}_mlst.tsv",
             "cgmlst_tsv": f"{accession}_cgmlst.tsv",
             "assembly_summary_tsv": f"{accession}_assembly_summary.tsv",
-            "ani_tsv": f"{accession}_ani.tsv" if args.reference and not args.no_ani else None,
+            "ani_tsv": f"{accession}_ani.tsv" if len(reference_ids) == 1 and not args.no_ani else None,
             "ska_distances_tsv": f"ska/{accession}_ska.distances.tsv" if not args.no_ska else None,
         },
     }

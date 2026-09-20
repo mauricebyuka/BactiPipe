@@ -17,10 +17,12 @@ from bactipipe.species_workflow import identification_database_kind, identify_as
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="bactipipe identify",
         description=(
             "Identify an assembled bacterial genome using whole-genome ANI and "
             "aligned fraction, while failing closed on mixed or ambiguous evidence."
-        )
+        ),
+        epilog="Separate placement: bactipipe identify --place --help. Redraw saved figures: bactipipe identify --render --help.",
     )
     parser.add_argument("--sample", required=True, help="Sample identifier")
     parser.add_argument("--assembly", required=True, help="Draft assembly FASTA")

@@ -203,6 +203,7 @@ def run_amr_for_sample(
     enable_card: bool,
     threads: int,
     organism: str,
+    enable_ncbi: bool = False,
     logger_fn=None,
 ) -> List[Dict[str, str]]:
     """
@@ -226,6 +227,28 @@ def run_amr_for_sample(
     abricate_env = os.getenv("ABRICATE_ENV", "genepid")
 
     rows: List[Dict[str, str]] = []
+
+    if enable_ncbi:
+        out_tsv = os.path.join(raw_dir, "abricate_ncbi", f"{sample}.tsv")
+        os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+        pending = out_tsv + ".partial"
+        prefix = _env_prefix("abricate", viramr_env=viramr_env, abricate_env=abricate_env)
+        cmd = prefix + ["--db", "ncbi", "--threads", str(threads),
+                        "--minid", str(min_id), "--mincov", str(min_cov), fasta]
+        if logger_fn:
+            logger_fn(f"[{sample}] AMR fallback: ABRicate/ncbi (no organism argument)")
+            logger_fn(f"[CMD] {' '.join(cmd)}")
+        with open(pending, "w") as output:
+            cp = subprocess.run(cmd, env=env, stdout=output, stderr=subprocess.PIPE, text=True)
+        if cp.returncode != 0:
+            if logger_fn:
+                logger_fn(cp.stderr, level="Warn")
+            raise subprocess.CalledProcessError(cp.returncode, cmd, stderr=cp.stderr)
+        with open(pending) as output:
+            if "GENE" not in output.readline().split():
+                raise RuntimeError(f"[{sample}] ABRicate/ncbi did not produce a valid results table")
+        os.replace(pending, out_tsv)
+        rows.extend(parse_abricate_tsv(out_tsv, sample=sample, database="ncbi", min_id=min_id, min_cov=min_cov))
 
     # --- AMRFinderPlus ---
     if enable_amrfinder:

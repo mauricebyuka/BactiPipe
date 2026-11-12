@@ -498,8 +498,26 @@ prepared_samples = prepare_batch(preparation_jobs, resources, report_preparation
 emit('read_qc', 'completed')
 emit('assembly', 'completed')
 emit('identification', total=len(preparation_jobs))
-# Identification is intentionally bounded to one sample at a time: it opens a
-# large reference index. It starts after preparation releases CPU/RAM resources.
+# Identification starts only after preparation releases its CPU/RAM budget.
+from bactipipe.identification_parallel import identify_batch, result_for
+identification_results = {}
+if species_identification_enabled:
+    identification_jobs = {}
+    for sample, preparation in prepared_samples.items():
+        organism = expected_organisms[sample]
+        genome = preparation.get('genome')
+        if (sample in bad_samples or is_lambda_control(organism) or preparation.get('failure')
+                or not genome or not os.path.isfile(genome) or not os.path.getsize(genome)):
+            continue
+        selected = preparation.get('selected') or {}
+        if selected.get('selected', {}).get('mean_quality', -1) < args.minqual:
+            continue
+        resolution = sample_resolutions[sample]
+        identification_jobs[sample] = (resolution.canonical_name if resolution.is_known else 'unknown',
+                                       genome, selected['selected_paths'])
+    identification_results = identify_batch(identification_jobs, identify_sample_with_ani,
+        cpus=cpus, database_root=args.species_database_root, memory_gb=min(memory_budget, available_memory_gb()),
+        report=report_preparation, audit_path=os.path.join(qc_out, 'identification_resources.json'))
 with(open(temp_qc_summary , 'w')) as qc_sum:
     writer = csv.writer(qc_sum, dialect='excel-tab')
     writer.writerow(["Sample",  "Mean_quality", "qc_verdict", "Expected organism", "Identified organism", "% Match", "Coverage Depth", "min_cov", "cov_verdict", "tax_confirm"])
@@ -513,7 +531,8 @@ with(open(temp_qc_summary , 'w')) as qc_sum:
             continue
         if sample in bad_samples:
             continue
-        emit('identification', sample=sample)
+        if sample not in identification_results:
+            emit('identification', sample=sample)
         fastqs = get_fastqs(sample, raw_reads)
         if not fastqs:
             time_print(f"WARNING: Sample [{sample}] does not have corresponding fastq files", "Fail")
@@ -601,13 +620,12 @@ with(open(temp_qc_summary , 'w')) as qc_sum:
                 if control_evidence["status"] == "Error":
                     sample_failure_audit.record_failure(sample_failures, sample, "control_confirmation", control_evidence["reason"])
                 reported_samples.add(sample)
+                emit('identification', 'failed' if control_evidence['status'] == 'Error' else 'completed', sample=sample)
                 continue
 
             if species_identification_enabled:
                 try:
-                    summary_fields = identify_sample_with_ani(
-                        sample, sys_organism, genome, fastqs, cpus
-                    )
+                    summary_fields = result_for(identification_results, sample)
                 except Exception as e:
                     time_print(f"Error at species identification step: {e}", "Fail")
                     logger(log, f"Error at species identification step: {e}")
@@ -691,6 +709,7 @@ with(open(temp_qc_summary , 'w')) as qc_sum:
 
             writer.writerow([sample, f'{avqc:.2f}', qc_verdict, organism, best_org, best_percent, cov_display, min_cov, cov_verdict, tax_confirm])
             reported_samples.add(sample)
+            emit('identification', 'skipped', sample=sample)
 
 sample_failure_audit.publish_failures(
     outDir,

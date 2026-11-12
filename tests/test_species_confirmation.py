@@ -133,7 +133,20 @@ class ConfirmationTests(unittest.TestCase):
         self.assertEqual(update_row(row, self.evaluate())['Overall Quality'], 'Pass')
         self.assertEqual(update_row(dict(row, **{'Mean quality': '9'}), self.evaluate())['Overall Quality'], 'Fail')
         self.assertEqual(update_row(dict(row, **{'CheckM completeness': 'N/A'}), self.evaluate())['Overall Quality'], 'Review')
-        self.assertEqual(update_row(dict(row, **{'Expected organism':'Salmonella enterica'}), self.evaluate())['Overall Quality'], 'Review')
+        self.assertEqual(update_row(dict(row, **{'Expected organism':'Salmonella enterica'}), self.evaluate())['Overall Quality'], 'Pass')
+
+    def test_new_unresolved_confirmation_clears_legacy_match_preserves_measurements(self):
+        row = {'Expected organism': 'Unknown', 'Identified organism': 'Staphylococcus aureus',
+            '% Match': '96.40', 'Mean quality': '25', 'Coverage Depth': '100X',
+            'Required depth': '50X', 'CheckM completeness': '99', 'CheckM contamination': '0'}
+        result = {'status': 'no_confident_identification'}
+        updated = update_row(row, result)
+        self.assertEqual(updated['Identified organism'], 'No confident identification')
+        self.assertEqual(updated['% Match'], 'N/A')
+        self.assertEqual(updated['Coverage Depth'], '100X')
+        self.assertEqual(updated['Overall Quality'], 'Review')
+        self.assertEqual(row['% Match'], '96.40')
+        self.assertEqual(update_row(dict(row, **{'CheckM contamination': '79.51'}), result)['Overall Quality'], 'Fail')
 
     def test_ecoli_confirmation_recalculates_illumina_depth_requirement(self):
         result = dict(self.evaluate(), reported_organism='Escherichia coli')

@@ -107,7 +107,7 @@ def legacy_summary_fields(result: IdentificationResult) -> LegacySummaryFields:
     """Adapt the richer result without inventing a numeric match value."""
 
     if result.status == "confirmed_species" or (
-        result.status == "suspected_culture_contamination"
+        result.status in {"suspected_culture_contamination", "mixed_signal_review"}
         and result.match_percent is not None
         and result.reported_organism != "No confident identification"
     ):
@@ -124,7 +124,8 @@ def legacy_summary_fields(result: IdentificationResult) -> LegacySummaryFields:
                 if result.match_percent is not None
                 else "N/A"
             ),
-            taxonomic_confirmation=result.taxonomic_confirmation,
+            taxonomic_confirmation=("MixedSignalReview" if result.status == "mixed_signal_review"
+                                    else result.taxonomic_confirmation),
             # Genome-size lookup remains species-specific even when the
             # diagnostic report deliberately uses a broader complex label.
             coverage_organism=coverage_organism,
@@ -138,7 +139,8 @@ def legacy_summary_fields(result: IdentificationResult) -> LegacySummaryFields:
     return LegacySummaryFields(
         identified_organism=label,
         match_percent="N/A",
-        taxonomic_confirmation=result.taxonomic_confirmation,
+        taxonomic_confirmation=("MixedSignalReview" if result.status == "mixed_signal_review"
+                                else result.taxonomic_confirmation),
         coverage_organism=coverage_organism,
     )
 
@@ -361,6 +363,12 @@ def _identify_assembly_once(
         policy=mixed_signal_policy,
         reporting_groups=reporting_groups,
     )
+    if mixed_signal.qualifying_secondary and catalog is not None:
+        from .assembly_mixture import investigate_assembly, apply_assembly_evidence
+        evidence = investigate_assembly(assembly=assembly, catalog=catalog,
+            mixed=mixed_signal, competitors=signals, ani_hits=ani_hits,
+            output_directory=output / "assembly_mixture", threads=threads)
+        mixed_signal = apply_assembly_evidence(mixed_signal, evidence)
     if require_mixed_signal_assessment and mixed_signal.status == "not_assessed":
         mixed_signal = MixedSignalAssessment(
             status="indeterminate",
@@ -444,6 +452,7 @@ def _identify_assembly_once(
             "kraken_confidence": kraken_confidence,
             "identification_thresholds": asdict(policy),
             "mixed_signal_thresholds": asdict(mixed_signal_policy),
+            "assembly_mixture_policy": mixed_signal.assembly_evidence.get("policy", {}),
             "mixed_signal_assessment_required": require_mixed_signal_assessment,
             "kraken_role": "candidate_nomination_only",
             "candidate_provider": (

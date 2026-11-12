@@ -15,6 +15,7 @@ import logging
 import textwrap
 import shutil
 from bactipipe.scripts.caps import CAPS, supported_rows
+from bactipipe.mlst_catalog import resolve_mlst
 from bactipipe.scripts import ska as ska2
 from bactipipe.scripts.runner import run as _run, ensure_dir as _ensure_dir
 from bactipipe.scripts.serotyping import serotype_dispatch
@@ -379,6 +380,7 @@ def run_cgmlst(
     logger: logging.Logger,
     scheme: str,
     env_name: Optional[str] = None,
+    timeout: int = 900,
 ) -> str:
     _ensure_dir(outdir)
     cmd = [
@@ -390,33 +392,50 @@ def run_cgmlst(
         "-t", str(tmpdir),
         "-q",
     ]
-    rc, out = _run(cmd, cwd=None, log=logger, env_name=env_name)
+    started = time.monotonic()
+    logger.info("cgMLST: %s (timeout %s seconds)", genome.name, timeout)
+    rc, out = _run(cmd, cwd=None, log=logger, env_name=env_name, timeout=timeout)
     (outdir / "cgmlst.stdout.txt").write_text(out)
+    evidence = {
+        "sample": genome.stem, "status": "completed" if rc == 0 else "failed",
+        "return_code": rc, "timeout_seconds": timeout,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
     if rc != 0:
-        logger.warning(f"cgMLST failed for {genome.name}")
+        evidence["status"] = "timed_out" if rc == 124 else "failed"
+        evidence["reason"] = (f"cgMLST exceeded its {timeout}-second time limit"
+                              if rc == 124 else f"cgMLST exited with status {rc}")
+    (outdir / "cgmlst_status.json").write_text(json.dumps(evidence, indent=2))
+    if rc != 0:
+        logger.warning("%s: %s; cgST unavailable. Continuing other analyses.",
+                       genome.name, evidence["reason"])
         return "NA"
 
     summ = outdir / f"{scheme}_summary.txt"
     if not summ.exists():
+        evidence.update(status="failed", reason="cgMLST summary was not produced")
+        (outdir / "cgmlst_status.json").write_text(json.dumps(evidence, indent=2))
         logger.warning(f"cgMLST summary not found for {genome.name}")
         return "NA"
 
     try:
         rows = [r.split("\t") for r in summ.read_text().splitlines() if r.strip()]
         if not rows:
-            return "NA"
+            raise ValueError("empty cgMLST summary")
         header = [h.strip().lower() for h in rows[0]]
         data = rows[1] if len(rows) > 1 else None
         if not data:
-            return "NA"
+            raise ValueError("cgMLST summary has no data row")
         for key in ["cgst", "cgmlst_st", "cgmlst st", "cgst id", "cg-mlst st"]:
             if key in header:
                 idx = header.index(key)
                 return data[idx].strip() or "NA"
         if len(data) >= 5:
             return data[4].strip() or "NA"
-        return "NA"
+        raise ValueError("cgMLST summary has no recognized cgST column")
     except Exception as e:
+        evidence.update(status="failed", reason=f"Could not parse cgMLST summary: {e}")
+        (outdir / "cgmlst_status.json").write_text(json.dumps(evidence, indent=2))
         logger.warning(f"Failed to parse cgMLST summary for {genome.name}: {e}")
         return "NA"
 
@@ -843,15 +862,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     opt.add_argument("--reference", type=Path, action="append", help="Reference genome; repeat for multiple references in one cohort.")
     opt.add_argument("--reference-id", action="append", help="Reference sample ID; repeat in the same order as --reference, or omit all to use FASTA IDs.")
     opt.add_argument("--reference-specimen", action="append", help="Reference Specimen label; repeat in the same order as --reference.")
-    opt.add_argument("--sample-order", choices=("display", "sheet"), default="display", help="Report order: display names (unnamed rows keep sheet order), or input sheet order.")
+    opt.add_argument("--sample-order", choices=("display", "sheet"), default="display", help="Report order: natural display-name order (sample ID when unnamed), or input sheet order.")
     opt.add_argument("--ani-tool", choices=["auto", "skani", "fastani"], default="auto",
                    help="ANI vs reference tool (auto prefers skani, else fastANI).")
     opt.add_argument("--db-dir", type=Path, help="DB root directory. Defaults to $BACTIPIPE_DB_DIR")
     opt.add_argument("--threads", type=int, default=4, help="Threads for serotyping (SeqSero2).")
     opt.add_argument("--list-organisms", action="store_true", help="List supported organisms/schemes and exit")
+    opt.add_argument("--list-mlst-schemes", action="store_true", help="List exact species names and preferred MLST schemes in the installed catalogue")
     opt.add_argument("--no-ska", action="store_true", help="Disable SKA split-kmer relatedness (enabled by default).")
     opt.add_argument("--no-ani", action="store_true", help="Disable ANI analysis (enabled by default).")
     opt.add_argument("--no-cgmlst", action="store_true", help="Disable cgMLST typing (enabled by default for supported organisms).")
+    opt.add_argument("--cgmlst-timeout", type=int, default=900, metavar="SECONDS",
+                     help="Maximum cgMLST runtime per genome (default: 900 seconds). A timeout leaves cgST unavailable and continues the cohort.")
     opt.add_argument("--no-pdf", action="store_true", help="Do not generate the consolidated PDF report.")
     opt.add_argument("-v", "--verbose", action="store_true", help="More console detail (DEBUG).")
     opt.add_argument(
@@ -878,9 +900,24 @@ def _build_argparser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = _build_argparser()
     args = ap.parse_args(argv)
+    if args.cgmlst_timeout <= 0:
+        ap.error("--cgmlst-timeout must be greater than zero")
     started_at = datetime.now().astimezone()
 
     # --- short-circuit: just list organisms and exit ---
+    if args.list_mlst_schemes:
+        database_root = args.db_dir or os.environ.get('BACTIPIPE_DB_DIR')
+        if not database_root:
+            ap.error('--db-dir or BACTIPIPE_DB_DIR is required to list installed schemes')
+        path = Path(database_root) / 'mlst_db' / 'mlst_catalog.json'
+        if not path.is_file():
+            ap.error('The expanded MLST catalogue is not installed')
+        catalog = json.loads(path.read_text())
+        states = {r.get('scheme'): r['status'] for r in catalog['schemes']}
+        _print_aligned_table(['species', 'preferred_scheme', 'status'], [
+            [r['species'], r['preferred_scheme'] or '-', states.get(r['preferred_scheme'], 'review required')]
+            for r in catalog['species']], pad=2)
+        return 0
     if args.list_organisms:
         headers = ["organism", "uses_mlst", "mlst_scheme", "uses_cgmlst", "cgmlst_scheme", "serotyper"]
         rows = supported_rows()  # you already normalized Nones inside this
@@ -930,13 +967,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     org = args.organism.lower()
     caps = CAPS.get(org, {})
-    need_mlst   = bool(caps.get("mlst"))
+    mlst_selection = resolve_mlst(args.organism, mlst_db_dir)
+    need_mlst = bool(mlst_selection.get('scheme'))
     if args.no_cgmlst:
         need_cgmlst = False
     else:
         need_cgmlst = bool(caps.get("cgmlst"))
 
-    mlst_scheme   = caps.get("mlst_scheme") if need_mlst else None
+    mlst_scheme = mlst_selection.get('scheme')
     cgmlst_scheme = caps.get("cgmlst_scheme") if need_cgmlst else None
 
     # Determine which serotyper this organism uses. An empty capability means
@@ -955,6 +993,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "references": [str(p.resolve()) for p in args.reference or []],
         "db_dir": str(db_dir.resolve()),
         "mlst_db_dir": str(mlst_db_dir) if need_mlst else None,
+        "mlst_selection": mlst_selection,
         "cgmlst_db_dir": str(cgmlst_db_dir) if need_cgmlst else None,
         "serotypefinder_db_dir": str(serotypefinder_db_dir) if uses_serofinder else None,
         "threads": args.threads,
@@ -962,6 +1001,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "run_ani": not args.no_ani,
         "run_ska": not args.no_ska,
         "run_cgmlst": not args.no_cgmlst,
+        "cgmlst_timeout_seconds": args.cgmlst_timeout,
         "render_pdf": not args.no_pdf,
         "phase": 2,
         "envs": {
@@ -980,7 +1020,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger = _init_logging(outdir, verbose=args.verbose)
 
     config_path = outdir / f"{accession}_run_config.json"
+    previous_selection = None
+    if args.resume and config_path.is_file():
+        previous_selection = json.loads(config_path.read_text()).get('mlst_selection')
     _write_run_config(run_cfg, config_path, logger)
+    logger.info('MLST selection: %s', json.dumps(mlst_selection, sort_keys=True))
+    if not need_mlst:
+        logger.warning('MLST not run: %s for %s', mlst_selection['status'], args.organism)
 
     # Preflight: check required tools
     logger.info("Preflight: checking required tools")
@@ -1108,7 +1154,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --- Per-sample typing for ALL organisms ---
     prev_sero = _load_prev_map_2col(paths["serotypes_tsv"]) if args.resume else {}
     prev_mlst = _load_prev_map_1col(paths["mlst_tsv"])      if args.resume else {}
+    if previous_selection != mlst_selection and not (previous_selection is None and mlst_selection['status'] == 'configured'):
+        prev_mlst = {}  # Never reuse STs under another scheme/database snapshot.
     prev_cgst = _load_prev_map_1col(paths["cgmlst_tsv"])    if args.resume else {}
+    # A failed/unavailable typing call is not a resumable success.
+    prev_cgst = {key: value for key, value in prev_cgst.items()
+                 if str(value).strip().upper() not in {"", "NA", "N/A", "NONE", "-"}}
+    typing_warnings = []
 
     # (Re)initialize the top-level TSVs
     with paths["serotypes_tsv"].open("w", newline="") as fh:
@@ -1164,7 +1216,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     Path(run_cfg["mlst_db_dir"]),
                     paths["tmpdir"],
                     logger,
-                    scheme=CAPS.get(args.organism.lower(), {}).get("mlst_scheme", "senterica"),
+                    scheme=mlst_scheme,
                     env_name=run_cfg["envs"].get("mlst"),
                 )
             with paths["mlst_tsv"].open("a", newline="") as fh:
@@ -1183,7 +1235,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logger,
                     scheme=CAPS.get(args.organism.lower(), {}).get("cgmlst_scheme"),
                     env_name=run_cfg["envs"].get("cgmlst"),
+                    timeout=args.cgmlst_timeout,
                 )
+                status_path = paths["cgmlst_root"] / rec.sample / "cgmlst_status.json"
+                if status_path.is_file():
+                    evidence = json.loads(status_path.read_text())
+                    if evidence.get("status") in {"failed", "timed_out"}:
+                        typing_warnings.append(dict(sample_id=rec.sample, tool="cgMLST", **evidence))
             with paths["cgmlst_tsv"].open("a", newline="") as fh:
                 csv.writer(fh, delimiter="\t").writerow([rec.sample, cgst])
     # =========================
@@ -1364,6 +1422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "completed_at": completed_at.isoformat(),
         "reference_sample": manifest[0].sample if args.reference and manifest else None,
         "reference_samples": reference_ids,
+        "warnings": typing_warnings,
         "reference_comparisons": [
             dict(sample_id=c['sample_id'],
                  ani_tsv=c['ani_tsv'].relative_to(outdir).as_posix() if not args.no_ani else None,
@@ -1375,6 +1434,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "ani_tool": args.ani_tool if not args.no_ani else None,
             "ska": not args.no_ska,
             "cgmlst": need_cgmlst,
+            "mlst": need_mlst,
+            "mlst_selection": mlst_selection,
+            "cgmlst_timeout_seconds": args.cgmlst_timeout,
             "threads": args.threads,
             "resume": bool(args.resume),
         },

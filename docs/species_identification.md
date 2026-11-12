@@ -143,13 +143,14 @@ non-specific classification among closely related bacteria. These settings
 must be estimated from pure isolates, defined mixtures, and background data;
 they are not controlled diagnostic defaults yet.
 
-After cohort cross-talk review, competitive mapping alone is still not enough
-to label an Illumina isolate as suspected culture contamination. A strong
-residual Illumina signal must also be corroborated by independent assembly QC;
-the current implementation uses CheckM contamination above the configured run
-limit. If CheckM is unavailable or remains within its limit, the secondary
-signal stays `mixed_signal_review`. Nanopore retains its platform-specific
-long-read evidence rule while both platforms preserve the same cohort review.
+On both platforms, competitive mapping is a screening step, not a contamination
+verdict. Flagged taxa now require separate, distributed assembly support after
+cohort cross-talk review. Shared assembly windows and closely overlapping
+references are recorded as reference ambiguity, not a second organism.
+CheckM remains an independent QC measurement: high contamination still fails QC,
+but low contamination does not alone establish purity. Inconclusive secondary
+evidence produces Review while preserving a confidently identified primary species.
+See [assembly-first contamination review](assembly_mixture.md) for the provisional policy.
 
 Within-sample mapping can establish that a secondary signal has distributed
 genome support, but it cannot determine whether that signal came from the
@@ -164,7 +165,8 @@ under secondary-signal review unless they also meet the stricter culture-
 contamination evidence tier. That tier currently requires the secondary to be
 at least 10% of competitively assigned reads, at least 25% as abundant as the
 primary, and distributed across at least 50% of its reference, while the primary
-must cover at least 70% of its reference. A strong signal is reported only as
+must cover at least 70% of its reference. These are screening gates only; the new
+assembly corroboration gates must also pass. A supported mixture retains the internal status
 `suspected_culture_contamination`, never as a definitive mixed infection. No negative control is required
 for this donor/recipient comparison. The initial validation policy requires at
 least 100 competitively mapped reads in the primary donor, a recipient-to-donor
@@ -182,7 +184,10 @@ The result states are:
 `confirmed_species` supplies ANI to the legacy `% Match` field. A sample with
 independently corroborated `suspected_culture_contamination` also retains a
 confident primary ANI identification when one exists; contamination remains a
-separate isolate-QC failure rather than erasing the primary organism. Other
+separate isolate-QC failure rather than erasing the primary organism. A
+`mixed_signal_review` also retains a confident primary ANI identification, with
+`Isolate QC=Review` (`tax_confirm=MixedSignalReview` in the temporary summary).
+Other unresolved
 states retain their closest-reference measurements in `closest_species.tsv`
 while the main result reports `N/A` match. A known expected organism that
 cannot be confirmed fails taxonomic confirmation; an Unknown expectation

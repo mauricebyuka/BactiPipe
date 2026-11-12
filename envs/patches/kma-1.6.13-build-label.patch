@@ -1,0 +1,5 @@
+--- a/version.h
++++ b/version.h
+@@ -22,1 +22,1 @@
+-#define KMA_VERSION "1.6.13"
++#define KMA_VERSION "1.6.13+adl-reassign-progress-1"

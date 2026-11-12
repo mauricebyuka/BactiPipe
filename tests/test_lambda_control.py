@@ -13,6 +13,43 @@ import pandas as pd
 
 
 class LambdaControlTests(unittest.TestCase):
+    def test_report_survives_low_depth_bacteria_and_keeps_control_verdict(self):
+        from bactipipe.batch_species import reconcile_batch_identifications
+        from bactipipe.scripts.sample_failures import publish_failures
+        for control_status in ('Pass', 'Fail'):
+            with self.subTest(control_status=control_status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source, final = root / 'temp.tsv', root / 'summary.tsv'
+                # One bacterium assembled below 50X; another could not assemble.
+                rows = [
+                    ['Sample', 'Q', 'qc', 'Expected', 'Hit', 'Match', 'Depth', 'Min', 'cov', 'tax'],
+                    ['S1', '21', 'Pass', 'Salmonella enterica', 'Salmonella enterica', '99', '11.27X', '50', 'Fail', 'Pass'],
+                    control_summary_row('Lambda', 21.9, 'Pass', 'Lambda', '300X', 50, 'Pass',
+                        {'status': control_status, 'identity_percent': 99.996}),
+                ]
+                with source.open('w') as handle:
+                    csv.writer(handle, delimiter='\t').writerows(rows)
+                publish_failures(root, source,
+                    {'Lambda': 'Lambda', 'S1': 'Salmonella enterica', 'S2': 'Salmonella enterica'},
+                    {'S2': ('assembly', 'Genome assembly did not produce a usable FASTA file.')}, required_depth=50)
+                # No species evidence directory must not prevent report publication.
+                self.assertEqual(reconcile_batch_identifications(
+                    species_output_root=root / 'species_identification', database_root=root / 'db',
+                    expected_organisms={'Lambda': 'Lambda', 'S2': 'Salmonella enterica'},
+                    platform='Nanopore'), {})
+                make_summary(str(final), str(source), [], {'S1': ('99', '0')}, logfile=str(root / 'log'))
+                lines = final.read_text().splitlines()
+                start = next(i for i, line in enumerate(lines) if line.startswith('Sample ID\t'))
+                results = list(csv.DictReader(lines[start:], delimiter='\t'))
+                self.assertEqual(results[0]['Sample ID'], 'Lambda')
+                self.assertEqual(results[0]['Overall Quality'], control_status)
+                by_sample = {row['Sample ID']: row for row in results}
+                self.assertEqual(by_sample['S1']['Coverage Depth'], '11.27X')
+                self.assertEqual(by_sample['S1']['Required depth'], '50X')
+                self.assertEqual(by_sample['S1']['Overall Quality'], 'Fail')
+                self.assertEqual(by_sample['S2']['Overall Quality'], 'Fail')
+                self.assertEqual(final.with_suffix('.pdf').read_bytes()[:5], b'%PDF-')
+
     def test_both_platforms_explicitly_assess_declared_controls(self):
         import ast
         for filename in ('run_illumina_qc.py', 'run_nanopore_qc.py'):

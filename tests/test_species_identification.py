@@ -330,7 +330,7 @@ class SpeciesDecisionTests(unittest.TestCase):
         self.assertEqual(result.status, "confirmed_species")
         self.assertEqual(result.reported_organism, records[1].species_name)
 
-    def test_strong_secondary_requires_cohort_review_before_contamination_call(self):
+    def test_strong_secondary_requires_cohort_and_independent_assembly_support(self):
         mixed = assess_mixed_signals(
             [
                 TaxonomicSignal("1", "Species alpha", 10000, 60.0, 90.0, 9000),
@@ -350,7 +350,7 @@ class SpeciesDecisionTests(unittest.TestCase):
             mixed_signal=mixed,
             cohort_review_complete=True,
         )
-        self.assertEqual(result.status, "suspected_culture_contamination")
+        self.assertEqual(result.status, "mixed_signal_review")
         self.assertEqual(result.reported_organism, "Species alpha")
         self.assertEqual(result.match_percent, 99.0)
 
@@ -371,9 +371,9 @@ class SpeciesDecisionTests(unittest.TestCase):
             contamination_evidence=checkm_contamination_evidence(1.0),
         )
         self.assertEqual(result.status, "mixed_signal_review")
-        self.assertIn("mapping alone is insufficient", result.reason)
+        self.assertIn("alone do not establish contamination", result.reason)
 
-    def test_illumina_checkm_corroborates_culture_contamination(self):
+    def test_checkm_does_not_assign_secondary_species_without_distinct_assembly_support(self):
         mixed = assess_mixed_signals(
             [
                 TaxonomicSignal("1", "Species alpha", 10000, 60.0, 90.0, 9000),
@@ -389,7 +389,7 @@ class SpeciesDecisionTests(unittest.TestCase):
             platform="Illumina",
             contamination_evidence=checkm_contamination_evidence(99.84),
         )
-        self.assertEqual(result.status, "suspected_culture_contamination")
+        self.assertEqual(result.status, "mixed_signal_review")
         self.assertEqual(result.reported_organism, "Species alpha")
         self.assertEqual(result.taxonomic_confirmation, "Pass")
         self.assertEqual(
@@ -435,7 +435,7 @@ class SpeciesDecisionTests(unittest.TestCase):
         )
         self.assertEqual(assessment.status, "single_signal")
 
-    def test_supported_minor_secondary_prevents_forced_species_call(self):
+    def test_supported_minor_secondary_preserves_confident_primary_with_review(self):
         assessment = assess_mixed_signals(
             [
                 TaxonomicSignal("1", "Species alpha", 10000, 90.0, 95.0, 9000),
@@ -449,7 +449,7 @@ class SpeciesDecisionTests(unittest.TestCase):
             mixed_signal=assessment,
         )
         self.assertEqual(result.status, "mixed_signal_review")
-        self.assertIsNone(result.match_percent)
+        self.assertEqual(result.match_percent, 99.0)
 
     def test_competitive_mapping_counts_override_classifier_counts(self):
         assessment = assess_mixed_signals(

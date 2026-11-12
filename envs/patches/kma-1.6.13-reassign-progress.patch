@@ -1,0 +1,13 @@
+--- a/reassign.c
++++ b/reassign.c
+@@ -584,7 +584,9 @@
+ 		if(0 <= (match = reassign_getoffset(consensus, *(qseq->seq), start))) {
+ 			start = match;
+ 		} else {
+-			start = qseq->seqlen;
++			/* No seed remains: this candidate cannot match. Do not reset
++			 * the search position, which can repeat forever. */
++			return -1;
+ 		}
+ 		
+ 		/* extend from there */

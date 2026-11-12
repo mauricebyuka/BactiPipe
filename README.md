@@ -61,7 +61,10 @@ The derived FASTA is removed after nomination; checksums and fragment coordinate
 remain in `species_identification/<sample>/speciesfinder_query/`.
 Read-level support for assembly-nominated taxa is confirmed by competitive mapping,
 and run-wide donor/recipient comparison distinguishes weak possible multiplex
-carryover from secondary signals requiring review or suspected culture contamination.
+carryover from secondary signals requiring review. Contamination calls now require
+independent, distributed assembly support on both platforms; shared-reference
+matches alone do not establish contamination. See
+[`assembly-first review`](docs/assembly_mixture.md) for the policy and limitations.
 The evidence remains available. The workflow can place unresolved non-mixed
 assemblies with GTDB bac120 markers. The older custom Kraken candidate remains
 available only for comparison and rollback. See
@@ -91,9 +94,10 @@ downstream manifest takes precedence over these automatic requests.
 The shared adapter is `bactipipe.primary_downstream.primary_downstream_tsv`.
 Standalone QC commands do not automatically schedule downstream work; `relate`
 and `detect` remain separate CLI commands consuming assemblies and command sheets.
-Both commands sort report samples by supplied display name, followed by unnamed
-samples in sheet order; `--sample-order sheet` preserves the entire input order.
-Reference rows remain first. `relate --reference-specimen TEXT` sets the reference
+Both commands naturally sort report samples by display name, falling back to
+sample ID when unnamed (for example, `-6B`, `-9`, `-15`). Sorting ignores case;
+reference rows remain first. `--sample-order sheet` preserves input order.
+`relate --reference-specimen TEXT` sets the reference
 row's Specimen label; the web application supplies its reference-library Display name.
 Repeat `--reference`, `--reference-id` and `--reference-specimen` in matching order
 for multiple references. Typing runs once per genome and SKA once per cohort;
@@ -185,6 +189,13 @@ Install or refresh the databases used by downstream typing and detection with:
 ```bash
 bactipipe update-db mlst serotypefinder virulencefinder cgmlstfinder amrfinder abricate
 ```
+
+For broad conventional MLST support beyond the configured organisms, use
+`bactipipe update-db mlst --all-schemes --seed ACTIVE_MLST_DB --output NEW_VERSION --work BUILD_WORKSPACE`.
+This prepares a separate, resumable catalogue without replacing the active database.
+`relate` then supports exact full-species-name lookup for nonconfigured organisms.
+See [MLST scheme installation and lookup](docs/mlst_scheme_catalog.md) for
+activation, preferences, provenance and public-access limitations.
 
 The former CGE `mlst_db` Bitbucket repository has been removed. BactiPipe therefore rebuilds the
 same directory format expected by CGE `mlst.py` from the official PubMLST and Institut Pasteur BIGSdb

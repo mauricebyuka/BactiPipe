@@ -9,6 +9,22 @@ from bactipipe.scripts.sample_failures import publish_failures
 
 
 class AssemblyDepthTests(unittest.TestCase):
+    def test_failed_samples_keep_measured_quality_without_inventing_missing_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            qc = root / 'qc_out/S1'
+            qc.mkdir(parents=True)
+            (qc / 'quality_metrics.txt').write_text('Trimmed Mean Read Quality: 21.08\n')
+            summary = root / 'summary.tsv'
+            publish_failures(root, summary, {'S1': 'Unknown', 'S2': 'Unknown'},
+                {sample: ('assembly', 'No assembly') for sample in ('S1', 'S2')},
+                required_depth=50, minimum_quality=15)
+            with summary.open() as handle:
+                first, second = list(csv.reader(handle, delimiter='\t'))
+            self.assertEqual(first[1:3], ['21.08', 'Pass'])
+            self.assertEqual(second[1:3], ['N/A', 'N/A'])
+            self.assertEqual(first[5:9], ['N/A', 'N/A', '50', 'N/A'])
+
     def test_depth_uses_all_contigs_and_retained_bases_without_taxonomy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

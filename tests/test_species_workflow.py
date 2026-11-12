@@ -305,7 +305,7 @@ class SpeciesWorkflowTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.status, "mixed_signal_review")
-            self.assertIsNone(result.match_percent)
+            self.assertEqual(result.match_percent, 99.0)
             payload = json.loads((output / "analysis_provenance.json").read_text())
             self.assertEqual(payload["database"]["version"], "candidate-v1")
             self.assertEqual(payload["tools"]["skani"], "v0.3.0")

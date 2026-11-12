@@ -7,11 +7,12 @@ from .qc_status import interpret, threshold_verdict
 def update_row(row, identification, *, platform='', quality=15, completeness=90,
                contamination=10, selected_mean_quality=None):
     row = dict(row)
-    if identification.get('status') != 'confirmed_species':
+    if identification.get('status') not in {'confirmed_species', 'no_confident_identification'}:
         return row
-    row['Identified organism'] = identification['reported_organism']
-    row['% Match'] = str(identification['match_percent'])
-    if platform.lower() == 'illumina':
+    confirmed = identification['status'] == 'confirmed_species'
+    row['Identified organism'] = identification['reported_organism'] if confirmed else 'No confident identification'
+    row['% Match'] = str(identification['match_percent']) if confirmed else 'N/A'
+    if confirmed and platform.lower() == 'illumina':
         from .scripts.qc_plan import illumina_minimum_coverage
         if selected_mean_quality is not None:
             row['Required depth'] = str(illumina_minimum_coverage(
@@ -26,7 +27,8 @@ def update_row(row, identification, *, platform='', quality=15, completeness=90,
               threshold_verdict(value('CheckM completeness'), completeness),
               threshold_verdict(value('CheckM contamination'), contamination, maximum=True)]
     verdict = interpret(row.get('Expected organism', ''), row['Identified organism'], grades,
-        isolate_qc_failure=str(row.get('Isolate QC', '')).lower() == 'fail')
+        isolate_qc_failure=str(row.get('Isolate QC', '')).lower() == 'fail',
+        isolate_qc_review=str(row.get('Isolate QC', '')).lower() == 'review')
     row['Overall Quality'] = verdict['overall']
     return row
 

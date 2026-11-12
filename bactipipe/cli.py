@@ -60,6 +60,10 @@ def main():
 
     cmd = sys.argv[1].lower()
     forwarded = sys.argv[2:]
+    if cmd == 'update-db' and forwarded[:1] == ['mlst'] and '--all-schemes' in forwarded:
+        from bactipipe.scripts.install_mlst_catalog import main as install_mlst
+        install_mlst(forwarded[1:])
+        return
     if cmd == "identify":
         modes = [flag for flag in ("--place", "--render") if flag in forwarded]
         if len(modes) > 1:

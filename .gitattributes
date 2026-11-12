@@ -1,0 +1,2 @@
+# Upstream patch context includes significant leading spaces before C tabs.
+envs/patches/*.patch -text -whitespace

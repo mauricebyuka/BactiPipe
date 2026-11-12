@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -141,6 +142,21 @@ class CrossSampleClassificationTests(unittest.TestCase):
 
 
 class BatchReconciliationTests(unittest.TestCase):
+    def test_control_only_or_no_bacterial_results_writes_empty_audit(self):
+        for expected in ({"Lambda": "Lambda"}, {"Lambda": "Lambda", "S1": "Salmonella enterica"}):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "species_identification"
+                result = reconcile_batch_identifications(
+                    species_output_root=root,
+                    database_root=Path(temporary) / "database",
+                    expected_organisms=expected,
+                    platform="Nanopore",
+                )
+                self.assertEqual(result, {})
+                audit = json.loads((root / "cross_sample_signal_review.json").read_text())
+                self.assertEqual(audit["sample_count"], 0)
+                self.assertEqual(len((root / "cross_sample_signal_review.tsv").read_text().splitlines()), 1)
+
     def test_unresolved_tree_is_published_after_cohort_decision(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -283,7 +299,7 @@ class BatchReconciliationTests(unittest.TestCase):
             self.assertEqual(final_row["Identified organism"], "Escherichia coli")
             self.assertNotIn("tax_confirm", final_row)
 
-    def test_illumina_contamination_requires_checkm_corroboration(self):
+    def test_checkm_does_not_replace_independent_assembly_support(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             database = self._database(root)
@@ -316,10 +332,29 @@ class BatchReconciliationTests(unittest.TestCase):
                 checkm_contamination_by_sample={"suspect": 99.84},
             )["suspect"]
             self.assertEqual(
-                contaminated.status, "suspected_culture_contamination"
+                contaminated.status, "mixed_signal_review"
             )
             self.assertEqual(contaminated.reported_organism, "Escherichia coli")
             self.assertEqual(contaminated.match_percent, 99.0)
+
+            # A genuinely corroborated pair remains Fail after reconciliation;
+            # the independently computed evidence must survive JSON publication.
+            import json
+            from dataclasses import asdict
+            from bactipipe.assembly_mixture import POLICY
+            result_path = species_root / 'suspect' / 'species_identification.json'
+            saved = json.loads(result_path.read_text())
+            saved['mixed_signal']['assembly_evidence'] = {
+                'policy': asdict(POLICY), 'status': 'assessed', 'primary_taxid': '562',
+                'species': {'562': {'independent_support': True},
+                            '28901': {'independent_support': True}}}
+            result_path.write_text(json.dumps(saved))
+            independent = reconcile_batch_identifications(
+                species_output_root=species_root, database_root=database,
+                expected_organisms={'suspect': 'Escherichia coli'}, platform='Illumina',
+                checkm_contamination_by_sample={'suspect': 1.0})['suspect']
+            self.assertEqual(independent.status, 'suspected_culture_contamination')
+            self.assertEqual(independent.mixed_signal.assembly_evidence['policy']['version'], POLICY.version)
 
     def test_final_summary_verdict_is_recalculated_from_updated_temporary_row(self):
         with tempfile.TemporaryDirectory() as temporary:

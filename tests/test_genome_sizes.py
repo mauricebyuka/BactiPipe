@@ -79,7 +79,7 @@ def test_worker_count_never_oversubscribes_explicit_cpu_allocation():
     ) == 2
 
 
-def test_nanopore_qc_gate_uses_each_samples_own_size():
+def test_nanopore_qc_gate_does_not_reject_low_estimated_depth():
     metrics = "Trimmed Total Bases: 100,000,000\nTrimmed Mean Read Quality: 16.2\n"
     assert nanopore_qc_failure_reason(
         metrics,
@@ -87,18 +87,29 @@ def test_nanopore_qc_gate_uses_each_samples_own_size():
         minimum_quality=15,
         minimum_coverage=50,
     ) is None
-    assert "below the required 50X" in nanopore_qc_failure_reason(
+    assert nanopore_qc_failure_reason(
         metrics,
         genome_size_bp=5_000_000,
         minimum_quality=15,
         minimum_coverage=50,
-    )
+    ) is None
     assert nanopore_qc_failure_reason(
         metrics,
         genome_size_bp=None,
         minimum_quality=15,
         minimum_coverage=50,
     ) is None
+
+
+def test_nanopore_qc_still_rejects_empty_low_quality_and_incomplete_reads():
+    for metrics, reason in [
+        ("Trimmed Total Bases: 0\nTrimmed Mean Read Quality: 16.2\n", "no sequence bases"),
+        ("Trimmed Total Bases: 100\nTrimmed Mean Read Quality: 9.9\n", "mean read quality"),
+        ("Trimmed Total Bases: 100\n", "complete QC outputs"),
+    ]:
+        assert reason in nanopore_qc_failure_reason(
+            metrics, genome_size_bp=None, minimum_quality=15, minimum_coverage=50
+        )
 
 
 def test_illumina_coverage_threshold_uses_identified_species():

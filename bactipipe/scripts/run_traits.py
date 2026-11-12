@@ -91,7 +91,7 @@ def parse_args(argv=None):
 
     opt.add_argument("--threads", type=int, default=8, help="CPU threads")
     opt.add_argument("--jobs", type=int, default=4, help="Maximum samples processed concurrently")
-    opt.add_argument("--sample-order", choices=("display", "sheet"), default="display", help="Report sample order (applies to matrix columns too).")
+    opt.add_argument("--sample-order", choices=("display", "sheet"), default="display", help="Report order: natural display-name order (sample ID when unnamed), or input sheet order; applies to matrix columns too.")
     # Escape % in help strings for argparse
     opt.add_argument("--min_identity", "--min-identity", dest="min_identity", type=float, default=90.0, help="Minimum %% identity")
     opt.add_argument("--min_coverage", "--min-coverage", dest="min_coverage", type=float, default=60.0, help="Minimum %% coverage")

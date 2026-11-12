@@ -519,6 +519,10 @@ def _download_legacy_mlst_scheme(
 def _update_mlst():
     """Rebuild the legacy CGE MLST layout from authoritative BIGSdb APIs."""
     db_dir = DB_SPECS["mlst"]["path"]()
+    if os.path.isfile(os.path.join(db_dir, 'mlst_catalog.json')):
+        raise RuntimeError('This database has an expanded MLST catalogue. Use update-db mlst '
+                           '--all-schemes --seed ACTIVE_DB --output NEW_VERSION --work BUILD_DIR; '
+                           'the configured-only updater must not remove installed schemes.')
     os.makedirs(DB_ROOT, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     backup_dir = f"{db_dir}.bak-{timestamp}"
@@ -798,6 +802,5 @@ def check_updates():
             print(f"{label:18} check not implemented")
 
     print("\nDone.\n")
-
 
 

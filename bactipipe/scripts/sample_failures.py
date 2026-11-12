@@ -33,6 +33,7 @@ def publish_failures(
     failures: dict[str, tuple[str, str]],
     *,
     required_depth: int | float,
+    minimum_quality: int | float | None = None,
 ) -> Path:
     """Write the audit and add one parseable placeholder row per failed sample."""
 
@@ -59,6 +60,20 @@ def publish_failures(
             if sample_id not in failures or sample_id in existing:
                 continue
             depth, depth_verdict, threshold = "N/A", "N/A", required_depth
+            quality, quality_verdict = "N/A", "N/A"
+            try:
+                metrics = dict(
+                    line.split(":", 1)
+                    for line in (outdir / "qc_out" / sample_id / "quality_metrics.txt").read_text().splitlines()
+                    if ":" in line
+                )
+                value = float(metrics["Trimmed Mean Read Quality"].strip())
+                if math.isfinite(value) and value >= 0:
+                    quality = f"{value:.2f}"
+                    if minimum_quality is not None:
+                        quality_verdict = "Pass" if value >= minimum_quality else "Fail"
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
             # If identification failed after successful assembly, preserve measured
             # depth while retaining the sample's independent execution failure.
             if failures[sample_id][0] == "organism_identification":
@@ -74,11 +89,11 @@ def publish_failures(
             writer.writerow(
                 (
                     sample_id,
-                    "0",
-                    "Fail",
+                    quality,
+                    quality_verdict,
                     expected_organisms[sample_id],
                     "Analysis failed",
-                    "0",
+                    "N/A",
                     depth,
                     threshold,
                     depth_verdict,

@@ -585,6 +585,7 @@ class MixedSignalAssessment:
     primary: TaxonomicSignal | None
     qualifying_secondary: tuple[TaxonomicSignal, ...] = ()
     reason: str = ""
+    assembly_evidence: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -931,8 +932,8 @@ def assess_mixed_signals(
             qualifying_secondary=tuple(item.primary for item in qualifying),
             reason=(
                 "At least one secondary species or reporting group has sufficient "
-                "competitive reads, meaningful abundance, and distributed genome "
-                "evidence."
+                "competitive read assignments and reference breadth for further "
+                "assessment. These measurements alone do not establish contamination."
             ),
         )
     if incomplete_evidence:
@@ -1030,8 +1031,9 @@ def decide_identification(
             closest = (report_hit, *closest[1:])
 
     if mixed_signal.status in {"mixed", "strong_secondary"}:
+        from .assembly_mixture import independent_mixture_supported
         if not cohort_review_complete:
-            return _result(
+            review = _result(
                 sample_id=sample_id,
                 status="mixed_signal_review",
                 expected_organism=expected_organism,
@@ -1046,18 +1048,23 @@ def decide_identification(
                 identification_thresholds=thresholds,
                 contamination_evidence=contamination_evidence,
             )
-        if (
-            normalised_platform == "illumina"
-            and contamination_evidence.status != "supports_contamination"
-        ):
-            return _result(
+            if report_hit is not None:
+                from dataclasses import replace
+                review = replace(review, reported_organism=report_hit.species_name,
+                    match_percent=report_hit.ani,
+                    taxonomic_confirmation=_taxonomic_confirmation(expected_organism,
+                        report_hit.species_name, accepted_names=accepted_names))
+            return review
+        if not independent_mixture_supported(mixed_signal):
+            review = _result(
                 sample_id=sample_id,
                 status="mixed_signal_review",
                 expected_organism=expected_organism,
                 reason=(
-                    "A strong secondary short-read mapping signal remained after "
-                    "cohort cross-talk review, but Illumina competitive mapping "
-                    "alone is insufficient to report culture contamination. "
+                    "A secondary signal remained after cohort cross-talk review, "
+                    "but independent, distributed assembly support for two genomes "
+                    "was not established. Competitive read assignments alone do "
+                    "not establish contamination on either sequencing platform. "
                     f"{contamination_evidence.reason}"
                 ),
                 closest=closest,
@@ -1066,9 +1073,17 @@ def decide_identification(
                 identification_thresholds=thresholds,
                 contamination_evidence=contamination_evidence,
             )
+            if report_hit is not None:
+                from dataclasses import replace
+                review = replace(review, reported_organism=report_hit.species_name,
+                    match_percent=report_hit.ani,
+                    taxonomic_confirmation=_taxonomic_confirmation(expected_organism,
+                        report_hit.species_name, accepted_names=accepted_names))
+            return review
         contamination_reason = (
-            "A strong secondary bacterial signal remained after cohort-level "
-            "cross-talk review, consistent with possible culture contamination."
+            "Independent, distributed assembly support for multiple bacterial "
+            "genomes remained after cohort-level cross-talk review. Contamination "
+            "is supported, but these data do not establish its source."
         )
         if contamination_evidence.status == "supports_contamination":
             contamination_reason += f" {contamination_evidence.reason}"
@@ -1112,7 +1127,7 @@ def decide_identification(
             if mixed_signal.status == "minor_secondary"
             else "Possible secondary species signals require review before a species call."
         )
-        return _result(
+        review = _result(
             sample_id=sample_id,
             status="mixed_signal_review",
             expected_organism=expected_organism,
@@ -1123,6 +1138,13 @@ def decide_identification(
             identification_thresholds=thresholds,
             contamination_evidence=contamination_evidence,
         )
+        if report_hit is not None:
+            from dataclasses import replace
+            review = replace(review, reported_organism=report_hit.species_name,
+                match_percent=report_hit.ani,
+                taxonomic_confirmation=_taxonomic_confirmation(expected_organism,
+                    report_hit.species_name, accepted_names=accepted_names))
+        return review
     if not passing:
         reason = (
             "No reference passed both the whole-genome ANI and bidirectional "
@@ -1173,6 +1195,7 @@ def decide_identification(
         reason=(
             "The top reference passed the ANI and aligned-fraction thresholds "
             "without an equally plausible independent competing organism."
+            + (f" {mixed_signal.reason}" if mixed_signal.status == "reference_ambiguity" else "")
         ),
         closest_species=closest,
         kmerfinder_support=tuple(kmerfinder_support),

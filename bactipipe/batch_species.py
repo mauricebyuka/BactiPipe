@@ -288,6 +288,9 @@ def reconcile_batch_identifications(
         prior_payload = json.loads(
             (sample_dir / "species_identification.json").read_text()
         )
+        from .assembly_mixture import apply_assembly_evidence
+        mixed = apply_assembly_evidence(mixed,
+            prior_payload.get("mixed_signal", {}).get("assembly_evidence", {}))
         kmer_support = tuple(
             KmerSpeciesEvidence(**row)
             for row in prior_payload.get("kmerfinder_support", ())
@@ -503,7 +506,8 @@ def update_summary_identifications(
         if "Overall Quality" in fieldnames:
             if "Isolate QC" not in fieldnames:
                 fieldnames.append("Isolate QC")
-            row["Isolate QC"] = "Fail" if result.status == "suspected_culture_contamination" else "Pass"
+            row["Isolate QC"] = ("Fail" if result.status == "suspected_culture_contamination"
+                                 else "Review" if result.status == "mixed_signal_review" else "Pass")
     temporary = summary.with_suffix(summary.suffix + ".tmp")
     with temporary.open("w", newline="") as handle:
         if prefix:
@@ -549,6 +553,7 @@ def update_final_summary_verdicts(
             [temporary_row.get("qc_verdict", "N/A"), temporary_row.get("cov_verdict", "N/A"),
              completeness_verdict, contamination_verdict],
             isolate_qc_failure=row.get("Isolate QC") == "Fail",
+            isolate_qc_review=row.get("Isolate QC") == "Review",
             control_qc=row.get("Control QC", "Not assessed"),
         )["overall"]
     temporary = final_path.with_suffix(final_path.suffix + ".tmp")
@@ -585,6 +590,9 @@ def _write_batch_audit(
     evidence: Mapping[str, Sequence[CrossSampleEvidence]],
     policy: CrossSamplePolicy,
 ) -> None:
+    # A control-only batch (including batches whose bacteria failed QC) has no
+    # species directory yet. An empty audit is valid, not a run-wide failure.
+    root.mkdir(parents=True, exist_ok=True)
     fields = [
         "sample_id",
         "species_taxid",

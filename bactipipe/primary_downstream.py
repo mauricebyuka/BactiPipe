@@ -13,6 +13,7 @@ import re
 from .downstream_manifest import DownstreamManifestError, _parse_rows
 from .organism_names import expected_organism_name
 from .scripts.caps import CAPS
+from .sample_table import is_footer
 
 
 RELATE_NAMES = {
@@ -40,8 +41,17 @@ def text(value):
 
 
 def report_order(rows, *, name_index=1):
-    """Named rows first (case-insensitive); unnamed rows retain worksheet order."""
-    return sorted(rows, key=lambda r: (not bool(text(r[name_index])), text(r[name_index]).casefold()))
+    """Natural report order by display name, falling back to stable sample ID.
+
+    Keep this presentation policy separate from manifest/cohort signatures so
+    changing report order never queues new biological analysis by itself.
+    Equal keys retain their input order (including leading-zero variants).
+    """
+    def key(row):
+        name = (text(row[name_index]) or text(row[0])).casefold()
+        return tuple((1, int(part)) if part.isdecimal() else (0, part)
+                     for part in re.split(r'(\d+)', name))
+    return sorted(rows, key=key)
 
 
 def organism_token(entered, command, detect_organisms=()):
@@ -103,6 +113,8 @@ def primary_downstream_tsv(path, *, detect_organisms=()):
                 i = columns.get(name)
                 return text(row[i]) if i is not None and i < len(row) else ''
             sid, entered = cell('accession number'), cell('bacteria species')
+            if is_footer(sid, entered):
+                break
             if started and not sid and not entered:
                 break
             if not sid and not entered:

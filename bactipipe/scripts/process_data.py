@@ -348,12 +348,11 @@ def make_summary(
             from bactipipe.qc_status import interpret
             interpretation = interpret(organism, hit, [qc_verdict, cov_verdict,
                                       completeness_verdict, contamination_verdict],
-                                      isolate_qc_failure=tax_confirm == "Contamination", control_qc=control_qc)
+                                      isolate_qc_failure=tax_confirm == "Contamination",
+                                      isolate_qc_review=tax_confirm == "MixedSignalReview", control_qc=control_qc)
             final_verdict = interpretation['overall']
-            # Explicit taxonomy review flags may include independently detected
-            # isolate concerns; do not turn those into a silent pass.
-            if tax_confirm in {"Fail", "Review"} and final_verdict == "Pass":
-                final_verdict = "Review"
+            # Taxonomic concordance is not a QC failure. Unresolved identification
+            # and independent contamination have already been handled by interpret.
             coverage = coverage.replace("X", "")
             cov_display = f'{float(coverage):.2f}X' if coverage != 'N/A' else 'N/A'
             match_display = (
@@ -361,16 +360,17 @@ def make_summary(
                 if str(match).strip().upper() in {"", "N/A", "NA", "NONE", "NULL", "-"}
                 else f"{float(match):.2f}"
             )
+            quality_display = "N/A" if avqc == "N/A" else f"{float(avqc):.2f}"
 
-            writer.writerow([sample, f'{float(avqc):.2f}', organism, hit, match_display, cov_display, f"{min_depth}X", completeness, contamination, final_verdict, "Fail" if tax_confirm == "Contamination" else "Pass", control_qc if control else "N/A"])
+            writer.writerow([sample, quality_display, organism, hit, match_display, cov_display, f"{min_depth}X", completeness, contamination, final_verdict, "Fail" if tax_confirm == "Contamination" else "Review" if tax_confirm == "MixedSignalReview" else "Pass", control_qc if control else "N/A"])
 
             simple_print(f'{sample} :: QC {final_verdict}!\n', final_verdict)
             logger(log, f'{sample} :: QC {final_verdict}!', final_verdict, mode="simple")
 
             simple_print(f'---> Species confirmation: {tax_confirm} --- {hit}', tax_confirm)
             logger(log, f'---> Species confirmation: {tax_confirm} --- {hit}', tax_confirm, mode="simple")
-            simple_print(f'---> Mean quality score: {qc_verdict} --- {float(avqc):.2f}', qc_verdict)
-            logger(log, f'---> Mean quality score: {qc_verdict} --- {float(avqc):.2f}', qc_verdict, mode="simple")
+            simple_print(f'---> Mean quality score: {qc_verdict} --- {quality_display}', qc_verdict)
+            logger(log, f'---> Mean quality score: {qc_verdict} --- {quality_display}', qc_verdict, mode="simple")
             if coverage != 'N/A':
                 simple_print(f'---> Genome coverage: {cov_verdict} --- {float(coverage):.2f}X', cov_verdict)
                 logger(log, f'---> Genome coverage: {cov_verdict} --- {float(coverage):.2f}X', cov_verdict, mode="simple")

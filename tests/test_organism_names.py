@@ -55,7 +55,9 @@ def test_no_fuzzy_species_guessing_or_subspecies_fallback(entered):
 ])
 def test_distinct_taxa_remain_distinct(expected, observed):
     assert _taxonomic_confirmation(expected, observed) == 'Fail'
-    assert interpret(expected, observed, ['Pass'] * 4)['overall'] == 'Review'
+    result = interpret(expected, observed, ['Pass'] * 4)
+    assert result['identification'] == 'mismatch'
+    assert result['overall'] == 'Pass'
 
 
 def test_identification_is_not_limited_to_qc_catalog():

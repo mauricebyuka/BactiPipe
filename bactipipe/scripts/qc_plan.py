@@ -81,7 +81,12 @@ def nanopore_qc_failure_reason(
     minimum_quality: float,
     minimum_coverage: float,
 ) -> str | None:
-    """Return a sample-level QC failure reason from Filtlong output metrics."""
+    """Reject unusable reads, not low predicted depth.
+
+    Genome size and minimum coverage remain accepted for caller compatibility.
+    Depth is a reporting threshold assessed against the actual assembly, not a
+    pre-assembly execution gate based on the expected organism's genome size.
+    """
 
     def metric(label: str) -> float | None:
         match = re.search(
@@ -97,18 +102,13 @@ def nanopore_qc_failure_reason(
     mean_quality = metric("Trimmed Mean Read Quality")
     if total_bases is None or mean_quality is None:
         return "Read quality filtering did not produce complete QC outputs."
+    if total_bases <= 0:
+        return "Read quality filtering retained no sequence bases."
     if mean_quality < minimum_quality:
         return (
             f"Trimmed mean read quality {mean_quality:.2f} is below the required "
             f"{minimum_quality:g}."
         )
-    if genome_size_bp is not None:
-        coverage = total_bases / genome_size_bp
-        if coverage < minimum_coverage:
-            return (
-                f"Trimmed read depth {coverage:.2f}X is below the required "
-                f"{minimum_coverage:g}X."
-            )
     return None
 
 

@@ -55,7 +55,7 @@ def threshold_verdict(value, threshold, *, maximum=False):
     return "Pass" if (value <= threshold if maximum else value >= threshold) else "Fail"
 
 
-def interpret(expected, identified, verdicts, *, analysis_failed=False, isolate_qc_failure=False, control_qc="Not assessed"):
+def interpret(expected, identified, verdicts, *, analysis_failed=False, isolate_qc_failure=False, isolate_qc_review=False, control_qc="Not assessed"):
     input_info = organism_input(expected)
     identification = identification_state(expected, identified)
     if is_lambda_control(expected):
@@ -70,7 +70,7 @@ def interpret(expected, identified, verdicts, *, analysis_failed=False, isolate_
     quality = quality_status(verdicts)
     if analysis_failed or isolate_qc_failure or identification == "analysis_failed" or quality == "Fail":
         overall = "Fail"
-    elif quality != "Pass" or input_info["warning"] or identification in {"mismatch", "unresolved"}:
+    elif quality != "Pass" or identification == "unresolved" or isolate_qc_review:
         overall = "Review"
     else:
         overall = "Pass"

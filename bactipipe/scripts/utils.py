@@ -290,13 +290,23 @@ def excel_reader(filepath: str, platform: str = "nanopore"):
     # sample table. A blank sample row ends that table; dropping blanks first
     # would join those unrelated sections back into the sample list. Barcode
     # presence must not determine this boundary (uploaded samples may omit it).
+    from bactipipe.sample_table import is_footer, valid_accession
     table_started = False
     for position, (_, row) in enumerate(df.iterrows()):
+        if is_footer(row["Accession Number"], row["Bacteria Species"]):
+            df = df.iloc[:position].copy()
+            break
         has_sample_fields = bool(row["Accession Number"] or row["Bacteria Species"])
         if table_started and not has_sample_fields:
             df = df.iloc[:position].copy()
             break
         if has_sample_fields:
+            accession = row["Accession Number"]
+            if accession and not valid_accession(accession):
+                raise ValueError(
+                    f"Row {data_start + position + 1}: invalid Accession Number {accession!r}. "
+                    "Use a sample identifier, or separate worksheet instructions from the sample table."
+                )
             table_started = True
 
     if "Other Bacteria Species" in df.columns:
